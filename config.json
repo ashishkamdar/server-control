@@ -1,0 +1,105 @@
+{
+  "password": "hjmXxUQQ9SL83uI4GtIr",
+  "port": 9000,
+  "apps": [
+    {
+      "name": "Server Control",
+      "description": "This control panel",
+      "workdir": "/opt/server-control",
+      "start_cmd": "systemctl start server-control",
+      "stop_cmd": "systemctl stop server-control",
+      "status_cmd": "systemctl is-active server-control && echo running",
+      "proc_match": "/opt/server-control",
+      "deps": [
+        "Go binary",
+        "nginx"
+      ]
+    },
+    {
+      "name": "hetalkamdar.com",
+      "description": "WordPress site (Apache + MySQL + PHP-FPM + Redis)",
+      "workdir": "/var/www/html",
+      "start_cmd": "systemctl start mysql && systemctl start php8.3-fpm && systemctl start apache2",
+      "stop_cmd": "systemctl stop apache2 && systemctl stop php8.3-fpm && systemctl stop mysql",
+      "status_cmd": "systemctl is-active apache2 && systemctl is-active mysql && systemctl is-active php8.3-fpm && echo running",
+      "proc_match": "apache2|mysqld|php-fpm",
+      "deps": [
+        "Apache2",
+        "MySQL",
+        "PHP 8.3-FPM",
+        "Redis"
+      ],
+      "metrics_cmd": "/opt/server-control/hetal_metrics.sh"
+    },
+    {
+      "name": "areakpi.in",
+      "description": "Static landing page",
+      "workdir": "/var/www/areakpi-landing",
+      "start_cmd": "echo 'Static site - served by nginx'",
+      "stop_cmd": "echo 'Static site - served by nginx'",
+      "status_cmd": "test -f /var/www/areakpi-landing/index.html && echo running",
+      "proc_match": "",
+      "deps": [
+        "nginx"
+      ]
+    },
+    {
+      "name": "JSG Seating",
+      "description": "Theater seating system",
+      "workdir": "/var/www/jsg-seating",
+      "start_cmd": "sudo -u www-data /var/www/jsg-seating/venv/bin/gunicorn --workers 2 --bind 127.0.0.1:5050 wsgi:app --daemon",
+      "stop_cmd": "pkill -f 'jsg-seating.*gunicorn' || true",
+      "status_cmd": "pgrep -f 'jsg-seating.*gunicorn' && echo running",
+      "proc_match": "jsg-seating.*gunicorn",
+      "deps": [
+        "Python",
+        "SQLite",
+        "gunicorn"
+      ],
+      "metrics_cmd": "/var/www/jsg-seating/venv/bin/python3 /var/www/jsg-seating/get_metrics.py",
+      "worker_pid_cmd": "pgrep -fo 'jsg-seating.*gunicorn'",
+      "worker_min": 2,
+      "worker_max": 12
+    },
+    {
+      "name": "Change Requests",
+      "description": "Change request tracking system",
+      "workdir": "/var/www/change-requests",
+      "start_cmd": "/var/www/change-requests/venv/bin/gunicorn -w 2 -b 127.0.0.1:5001 wsgi:application --daemon",
+      "stop_cmd": "pkill -f 'change-requests.*gunicorn' || true",
+      "status_cmd": "pgrep -f 'change-requests.*gunicorn' && echo running",
+      "proc_match": "change-requests.*gunicorn",
+      "deps": [
+        "Python",
+        "SQLite",
+        "gunicorn"
+      ],
+      "metrics_cmd": "/var/www/change-requests/venv/bin/python3 /var/www/change-requests/get_metrics.py"
+    },
+    {
+      "name": "NSWADI App",
+      "description": "NSWADI application (systemd managed)",
+      "workdir": "/home/nswadi/app",
+      "start_cmd": "systemctl start nswadi",
+      "stop_cmd": "systemctl stop nswadi",
+      "status_cmd": "systemctl is-active nswadi && echo running",
+      "proc_match": "nswadi.*gunicorn",
+      "deps": [
+        "Python",
+        "gunicorn",
+        "systemd"
+      ]
+    },
+    {
+      "name": "Nginx",
+      "description": "Main reverse proxy for all sites",
+      "workdir": "/etc/nginx",
+      "start_cmd": "systemctl start nginx",
+      "stop_cmd": "systemctl stop nginx",
+      "status_cmd": "systemctl is-active nginx && echo running",
+      "proc_match": "nginx: ",
+      "deps": [],
+      "metrics_cmd": "/opt/server-control/nginx_metrics.sh"
+    }
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "name": "MG Demo",
+  "description": "Matunga Gymkhana demo site",
+  "workdir": "/var/www/matunga_gymkhana",
+  "start_cmd": "systemctl start mgdemo",
+  "stop_cmd": "systemctl stop mgdemo",
+  "status_cmd": "systemctl is-active mgdemo && echo running",
+  "proc_match": "matunga_gymkhana.*gunicorn",
+  "deps": ["Python", "gunicorn", "systemd"]
+}

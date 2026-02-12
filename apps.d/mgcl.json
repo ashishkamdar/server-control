@@ -1,0 +1,10 @@
+{
+  "name": "MGCL Tournament",
+  "description": "MGCL tournament management",
+  "workdir": "/home/adminuser/mgcl_tournament",
+  "start_cmd": "systemctl start mgcl",
+  "stop_cmd": "systemctl stop mgcl",
+  "status_cmd": "systemctl is-active mgcl && echo running",
+  "proc_match": "mgcl_tournament.*gunicorn",
+  "deps": ["Python", "gunicorn", "systemd"]
+}
