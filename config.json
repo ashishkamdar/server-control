@@ -29,7 +29,8 @@
         "PHP 8.3-FPM",
         "Redis"
       ],
-      "metrics_cmd": "/opt/server-control/hetal_metrics.sh"
+      "metrics_cmd": "/opt/server-control/hetal_metrics.sh",
+      "log_pattern": "hetalkamdar.com"
     },
     {
       "name": "areakpi.in",
@@ -59,7 +60,8 @@
       "metrics_cmd": "/var/www/jsg-seating/venv/bin/python3 /var/www/jsg-seating/get_metrics.py",
       "worker_pid_cmd": "pgrep -fo 'jsg-seating.*gunicorn'",
       "worker_min": 2,
-      "worker_max": 12
+      "worker_max": 12,
+      "log_pattern": "jsg1.areakpi.in"
     },
     {
       "name": "Change Requests",
@@ -74,7 +76,8 @@
         "SQLite",
         "gunicorn"
       ],
-      "metrics_cmd": "/var/www/change-requests/venv/bin/python3 /var/www/change-requests/get_metrics.py"
+      "metrics_cmd": "/var/www/change-requests/venv/bin/python3 /var/www/change-requests/get_metrics.py",
+      "log_pattern": "cr.areakpi.in"
     },
     {
       "name": "NSWADI App",
@@ -88,7 +91,8 @@
         "Python",
         "gunicorn",
         "systemd"
-      ]
+      ],
+      "log_pattern": "nswadi"
     },
     {
       "name": "Nginx",
