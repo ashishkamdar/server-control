@@ -125,6 +125,22 @@
       "proc_match": "nginx: ",
       "deps": [],
       "metrics_cmd": "/opt/server-control/nginx_metrics.sh"
+    },
+    {
+      "name": "Security Dashboard",
+      "description": "Server protection status and threat monitoring",
+      "workdir": "/opt/server-control",
+      "start_cmd": "systemctl start fail2ban",
+      "stop_cmd": "systemctl stop fail2ban",
+      "status_cmd": "systemctl is-active fail2ban && echo running",
+      "proc_match": "fail2ban",
+      "deps": [
+        "fail2ban",
+        "nginx",
+        "iptables"
+      ],
+      "metrics_cmd": "/opt/server-control/security_metrics.sh",
+      "is_security_dashboard": true
     }
   ]
 }
