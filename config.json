@@ -80,6 +80,27 @@
       "log_pattern": "cr.areakpi.in"
     },
     {
+      "name": "Olistic",
+      "description": "Next.js app with Firebase",
+      "workdir": "/var/www/olistic",
+      "start_cmd": "export HOME=/root PM2_HOME=/root/.pm2; cd /var/www/olistic && /usr/bin/pm2 start npm --name olistic -- start",
+      "stop_cmd": "export HOME=/root PM2_HOME=/root/.pm2; /usr/bin/pm2 stop olistic",
+      "status_cmd": "export HOME=/root PM2_HOME=/root/.pm2; test -n \"$(/usr/bin/pm2 pid olistic 2>/dev/null)\" && echo running",
+      "proc_match": "olistic",
+      "deps": [
+        "Node.js",
+        "PM2",
+        "Firebase"
+      ],
+      "metrics_cmd": "/opt/server-control/olistic_metrics.sh",
+      "worker_add_cmd": "export HOME=/root PM2_HOME=/root/.pm2; /usr/bin/pm2 scale olistic +1",
+      "worker_remove_cmd": "export HOME=/root PM2_HOME=/root/.pm2; /usr/bin/pm2 scale olistic -1",
+      "worker_count_cmd": "export HOME=/root PM2_HOME=/root/.pm2; /usr/bin/pm2 jlist 2>/dev/null | python3 -c 'import sys,json; apps=json.load(sys.stdin); print(sum(1 for a in apps if a.get(\"name\")==\"olistic\"))'",
+      "worker_min": 1,
+      "worker_max": 4,
+      "log_pattern": "olistic.areakpi.in"
+    },
+    {
       "name": "NSWADI App",
       "description": "NSWADI application (systemd managed)",
       "workdir": "/home/nswadi/app",
