@@ -540,12 +540,12 @@ func getReqPerMin(metrics []AppMetric) int {
 
 func getWorkerCount(procMatch string) int {
 	if procMatch == "" { return 0 }
-	out, err := runCmdTimeout("pgrep -f +procMatch+", 2*time.Second)
+	out, err := runCmdTimeout("pgrep -f '"+procMatch+"'", 2*time.Second)
 	if err != nil { return 0 }
 	pids := strings.Split(strings.TrimSpace(out), "\n")
 	count := 0
 	for _, p := range pids { if p != "" { count++ } }
-	if count > 0 { count-- }
+	if count > 0 { count-- } // Subtract 1 for master process
 	return count
 }
 
