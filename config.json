@@ -61,7 +61,10 @@
       "worker_pid_cmd": "pgrep -fo 'jsg-seating.*gunicorn'",
       "worker_min": 2,
       "worker_max": 12,
-      "log_pattern": "jsg1.areakpi.in"
+      "log_pattern": "jsg1.areakpi.in",
+      "auto_scale_enabled": true,
+      "auto_scale_up_threshold": 8,
+      "auto_scale_down_threshold": 2
     },
     {
       "name": "Change Requests",

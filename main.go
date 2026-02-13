@@ -39,6 +39,7 @@ type App struct {
 	LogPattern        string   `json:"log_pattern"`
 	IsSecurityDashboard bool   `json:"is_security_dashboard"`
 	// Auto-scaling configuration
+	AutoScaleEnabled       bool    `json:"auto_scale_enabled"`        // enable auto-scaling on startup
 	AutoScaleUpThreshold   float64 `json:"auto_scale_up_threshold"`   // req/min per worker to scale up (default: 8)
 	AutoScaleDownThreshold float64 `json:"auto_scale_down_threshold"` // req/min per worker to scale down (default: 2)
 }
@@ -895,6 +896,15 @@ func logoutHandler(w http.ResponseWriter, r *http.Request) {
 
 func main() {
 	if err := loadConfig(); err != nil { log.Fatalf("Failed to load config: %v", err) }
+
+	// Initialize auto-scaling for apps with auto_scale_enabled in config
+	for _, app := range config.Apps {
+		if app.AutoScaleEnabled && (app.WorkerPidCmd != "" || app.WorkerAddCmd != "") {
+			autoScaleStates[app.Name] = &AutoScaleState{Enabled: true}
+			log.Printf("[AutoScale] %s: auto-scaling enabled on startup", app.Name)
+		}
+	}
+
 	http.HandleFunc("/login", loginHandler)
 	http.HandleFunc("/logout", logoutHandler)
 	http.HandleFunc("/", basicAuth(indexHandler))
