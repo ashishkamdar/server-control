@@ -38,6 +38,18 @@ type App struct {
 	WorkerCountCmd    string   `json:"worker_count_cmd"`
 	LogPattern        string   `json:"log_pattern"`
 	IsSecurityDashboard bool   `json:"is_security_dashboard"`
+	// Auto-scaling configuration
+	AutoScaleUpThreshold   float64 `json:"auto_scale_up_threshold"`   // req/min per worker to scale up (default: 8)
+	AutoScaleDownThreshold float64 `json:"auto_scale_down_threshold"` // req/min per worker to scale down (default: 2)
+}
+
+// Auto-scaling state
+type AutoScaleState struct {
+	Enabled      bool
+	LastAction   string    // "scaled_up", "scaled_down", "no_change"
+	LastActionAt time.Time
+	LastReqRate  float64
+	TargetWorkers int
 }
 
 type Config struct {
@@ -105,6 +117,8 @@ type AppStatus struct {
 	ErrorURLs    []ErrorURL
 	RefreshTime  string
 	Security     *SecurityData
+	// Auto-scaling status
+	AutoScale    *AutoScaleState
 }
 
 var (
@@ -116,6 +130,9 @@ var (
 	errorURLCache     = make(map[string][]ErrorURL)
 	errorURLCacheTime time.Time
 	errorURLCacheMu   sync.RWMutex
+	// Auto-scaling state per app
+	autoScaleStates   = make(map[string]*AutoScaleState)
+	autoScaleMu       sync.RWMutex
 )
 
 func loadConfig() error {
@@ -532,6 +549,124 @@ func getWorkerCount(procMatch string) int {
 	return count
 }
 
+// Auto-scaling functions
+func getAutoScaleState(appName string) *AutoScaleState {
+	autoScaleMu.RLock()
+	defer autoScaleMu.RUnlock()
+	if state, ok := autoScaleStates[appName]; ok {
+		return state
+	}
+	return &AutoScaleState{Enabled: false}
+}
+
+func setAutoScaleEnabled(appName string, enabled bool) {
+	autoScaleMu.Lock()
+	defer autoScaleMu.Unlock()
+	if _, ok := autoScaleStates[appName]; !ok {
+		autoScaleStates[appName] = &AutoScaleState{}
+	}
+	autoScaleStates[appName].Enabled = enabled
+	if !enabled {
+		autoScaleStates[appName].LastAction = "disabled"
+		autoScaleStates[appName].LastActionAt = time.Now()
+	}
+}
+
+func calculateAutoScale(app App, workerCount int, metrics []AppMetric, sysMetrics SystemMetrics) (action string, targetWorkers int, reqRate float64) {
+	// Get request rate from metrics
+	reqRate = 0
+	for _, m := range metrics {
+		if m.Label == "Req/min" {
+			val := strings.ReplaceAll(m.Value, ",", "")
+			if n, err := strconv.ParseFloat(val, 64); err == nil {
+				reqRate = n
+			}
+		}
+	}
+
+	if workerCount == 0 {
+		return "no_workers", 0, reqRate
+	}
+
+	// Calculate req per worker
+	reqPerWorker := reqRate / float64(workerCount)
+
+	// Get thresholds (use defaults if not configured)
+	upThreshold := app.AutoScaleUpThreshold
+	if upThreshold == 0 { upThreshold = 8.0 } // Default: scale up if >8 req/min per worker
+	downThreshold := app.AutoScaleDownThreshold
+	if downThreshold == 0 { downThreshold = 2.0 } // Default: scale down if <2 req/min per worker
+
+	targetWorkers = workerCount
+	action = "optimal"
+
+	// Check if we should scale up
+	if reqPerWorker > upThreshold && workerCount < app.WorkerMax {
+		// Check server resources before scaling up
+		if sysMetrics.CPUPercent < 80 && sysMetrics.MemPercent < 85 {
+			targetWorkers = workerCount + 1
+			action = "scale_up"
+		} else {
+			action = "resource_limited"
+		}
+	}
+
+	// Check if we should scale down
+	if reqPerWorker < downThreshold && workerCount > app.WorkerMin {
+		targetWorkers = workerCount - 1
+		action = "scale_down"
+	}
+
+	return action, targetWorkers, reqRate
+}
+
+func performAutoScale(app App, action string, targetWorkers int) {
+	autoScaleMu.Lock()
+	defer autoScaleMu.Unlock()
+
+	if _, ok := autoScaleStates[app.Name]; !ok {
+		autoScaleStates[app.Name] = &AutoScaleState{Enabled: true}
+	}
+	state := autoScaleStates[app.Name]
+
+	// Rate limit: don't scale more than once per 60 seconds
+	if time.Since(state.LastActionAt) < 60*time.Second && state.LastAction != "" {
+		return
+	}
+
+	var cmd string
+	if action == "scale_up" {
+		if app.WorkerAddCmd != "" {
+			cmd = app.WorkerAddCmd
+		} else if app.WorkerPidCmd != "" {
+			pidOut, _ := runCmdTimeout(app.WorkerPidCmd, 2*time.Second)
+			pids := strings.Split(strings.TrimSpace(pidOut), "\n")
+			if len(pids) > 0 && pids[0] != "" {
+				cmd = "kill -TTIN " + pids[0]
+			}
+		}
+	} else if action == "scale_down" {
+		if app.WorkerRemoveCmd != "" {
+			cmd = app.WorkerRemoveCmd
+		} else if app.WorkerPidCmd != "" {
+			pidOut, _ := runCmdTimeout(app.WorkerPidCmd, 2*time.Second)
+			pids := strings.Split(strings.TrimSpace(pidOut), "\n")
+			if len(pids) > 0 && pids[0] != "" {
+				cmd = "kill -TTOU " + pids[0]
+			}
+		}
+	}
+
+	if cmd != "" {
+		output, err := runCmdTimeout(cmd, 10*time.Second)
+		log.Printf("[AutoScale] %s: %s -> %d workers (cmd: %v, err: %v, out: %s)",
+			app.Name, action, targetWorkers, cmd, err, output)
+		state.LastAction = action
+		state.LastActionAt = time.Now()
+		state.TargetWorkers = targetWorkers
+	}
+}
+
 func getAppStatus(app App) AppStatus {
 	status := AppStatus{App: app, Status: "stopped", CanScale: app.WorkerPidCmd != "" || app.WorkerAddCmd != ""}
 	if app.StatusCmd != "" {
@@ -544,14 +679,14 @@ func getAppStatus(app App) AppStatus {
 		status.CPUPercent = cpu
 		status.MemMB = mem
 	}
-	
+
 	// Handle Security Dashboard specially
 	if app.IsSecurityDashboard {
 		status.Security = getSecurityData(app.MetricsCmd)
 	} else if app.MetricsCmd != "" {
 		status.Metrics = getAppMetrics(app.MetricsCmd)
 	}
-	
+
 	if app.WorkerCountCmd != "" {
 		out, err := runCmdTimeout(app.WorkerCountCmd, 3*time.Second)
 		if err == nil {
@@ -563,7 +698,50 @@ func getAppStatus(app App) AppStatus {
 	if app.LogPattern != "" { status.ErrorURLs = getAppErrorURLs(app.Name) }
 	ist := time.FixedZone("IST", 5*3600+30*60)
 	status.RefreshTime = time.Now().In(ist).Format("15:04:05")
+
+	// Get auto-scaling state if app supports scaling
+	if status.CanScale {
+		state := getAutoScaleState(app.Name)
+		status.AutoScale = &AutoScaleState{
+			Enabled:       state.Enabled,
+			LastAction:    state.LastAction,
+			LastActionAt:  state.LastActionAt,
+			LastReqRate:   state.LastReqRate,
+			TargetWorkers: state.TargetWorkers,
+		}
+	}
+
 	return status
+}
+
+// Separate function to run auto-scaling (called from indexHandler with system metrics)
+func runAutoScaleCheck(app App, status *AppStatus, sysMetrics SystemMetrics) {
+	if !status.CanScale { return }
+
+	state := getAutoScaleState(app.Name)
+	if !state.Enabled { return }
+
+	action, targetWorkers, reqRate := calculateAutoScale(app, status.WorkerCount, status.Metrics, sysMetrics)
+
+	// Update state with current calculation
+	autoScaleMu.Lock()
+	if _, ok := autoScaleStates[app.Name]; !ok {
+		autoScaleStates[app.Name] = &AutoScaleState{Enabled: true}
+	}
+	autoScaleStates[app.Name].LastReqRate = reqRate
+	autoScaleStates[app.Name].TargetWorkers = targetWorkers
+	if action != "scale_up" && action != "scale_down" {
+		autoScaleStates[app.Name].LastAction = action
+	}
+	autoScaleMu.Unlock()
+
+	// Perform scaling if needed
+	if action == "scale_up" || action == "scale_down" {
+		performAutoScale(app, action, targetWorkers)
+	}
+
+	// Update status for display
+	status.AutoScale = getAutoScaleState(app.Name)
 }
 
 func basicAuth(next http.HandlerFunc) http.HandlerFunc {
@@ -589,21 +767,25 @@ func indexHandler(w http.ResponseWriter, r *http.Request) {
 	metrics := getSystemMetrics()
 	var apps []AppStatus
 	var securityApp *AppStatus
-	
+
 	for _, app := range config.Apps {
 		status := getAppStatus(app)
+		// Run auto-scaling check if enabled
+		if status.CanScale {
+			runAutoScaleCheck(app, &status, metrics)
+		}
 		if app.IsSecurityDashboard {
 			securityApp = &status
 		} else {
 			apps = append(apps, status)
 		}
 	}
-	
+
 	// Sort regular apps by activity
 	sort.Slice(apps, func(i, j int) bool {
 		return getReqPerMin(apps[i].Metrics) > getReqPerMin(apps[j].Metrics)
 	})
-	
+
 	// Append security dashboard at the end if it exists
 	if securityApp != nil {
 		apps = append(apps, *securityApp)
@@ -627,8 +809,15 @@ func indexHandler(w http.ResponseWriter, r *http.Request) {
 			default: return "#888"
 			}
 		},
+		"timeAgo": func(t time.Time) string {
+			if t.IsZero() { return "never" }
+			d := time.Since(t)
+			if d < time.Minute { return "just now" }
+			if d < time.Hour { return fmt.Sprintf("%dm ago", int(d.Minutes())) }
+			return fmt.Sprintf("%dh ago", int(d.Hours()))
+		},
 	}
-	tmpl := `<!DOCTYPE html><html><head><title>Server Control</title><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="30"><style>*{box-sizing:border-box}body{font-family:-apple-system,sans-serif;background:#1a1a2e;color:#eee;margin:0;padding:15px}h1{color:#e94560;font-size:1.4em;margin:0 0 15px}.header{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;margin-bottom:15px}.header-links a{color:#74b9ff;text-decoration:none;margin-left:15px;font-size:.9em}.metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;margin-bottom:20px}.metric{background:#16213e;padding:15px;border-radius:10px;text-align:center}.metric-value{font-size:1.8em;font-weight:bold}.metric-label{font-size:.75em;color:#888;margin-top:5px}.metric-sub{font-size:.7em;color:#666}.green{color:#00b894}.yellow{color:#fdcb6e}.red{color:#e74c3c}.apps{display:grid;gap:12px}.app{background:#16213e;padding:15px;border-radius:10px}.app-header{display:flex;justify-content:space-between;align-items:flex-start;gap:10px;margin-bottom:10px}.app-name{font-size:1.1em;font-weight:600;color:#74b9ff;flex:1}.status{padding:4px 12px;border-radius:15px;font-size:.75em;font-weight:600}.status.running{background:#00b894}.status.stopped{background:#d63031}.app-desc{color:#a0a0a0;font-size:.85em;margin-bottom:10px}.app-stats{display:flex;gap:10px;font-size:.8em;color:#888;margin-bottom:12px;flex-wrap:wrap}.app-stats span{background:#0d1b2a;padding:4px 10px;border-radius:5px}.app-metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(90px,1fr));gap:8px;margin-bottom:12px}.error-urls{background:#0d1b2a;border-radius:8px;padding:10px 12px;margin-bottom:12px;font-size:.75em}.error-urls-title{font-weight:600;margin-bottom:6px}.error-urls-row{display:flex;gap:8px;margin-bottom:4px;align-items:baseline}.error-urls-label{min-width:60px;font-weight:500}.error-urls-value{color:#aaa;word-break:break-all}.error-section{background:#0d1b2a;border-radius:8px;padding:12px;margin-bottom:12px;width:100%}.error-section-title{font-weight:600;margin-bottom:8px;font-size:.85em;color:#888}.error-row{display:flex;gap:12px;margin-bottom:6px;font-size:.8em;align-items:baseline}.error-type{min-width:40px;font-weight:600}.error-url{flex:1;color:#aaa;word-break:break-all;font-family:monospace;font-size:.9em}.error-meta{color:#666;white-space:nowrap;font-size:.9em}.app-metric{background:#0d1b2a;padding:10px 8px;border-radius:8px;text-align:center}.app-metric-value{font-size:1.3em;font-weight:bold;color:#fff}.app-metric-label{font-size:.65em;color:#888;margin-top:3px}.worker-control{display:flex;align-items:center;gap:8px;background:#0d1b2a;padding:8px 12px;border-radius:8px;margin-bottom:12px}.worker-control span{font-size:.85em;color:#9b59b6}.worker-btn{width:28px;height:28px;border:none;border-radius:6px;cursor:pointer;font-size:1.1em;font-weight:bold;display:flex;align-items:center;justify-content:center}.worker-btn.add{background:#27ae60;color:white}.worker-btn.remove{background:#e74c3c;color:white}.worker-btn:disabled{opacity:.3;cursor:not-allowed}.worker-count{font-size:1.2em;font-weight:bold;color:#9b59b6;min-width:20px;text-align:center}.deps{font-size:.75em;color:#636e72;margin-bottom:12px}.actions{display:flex;gap:8px;flex-wrap:wrap}.btn{padding:10px 18px;border:none;border-radius:6px;cursor:pointer;font-size:.85em;font-weight:600;flex:1;min-width:80px;display:flex;align-items:center;justify-content:center;gap:8px}.btn-start{background:#00b894;color:white}.btn-stop{background:#d63031;color:white}.btn-restart{background:#fdcb6e;color:#333}.btn:disabled{opacity:.4;cursor:not-allowed}.btn.loading{opacity:.7;cursor:wait}.spinner{width:14px;height:14px;border:2px solid transparent;border-top-color:currentColor;border-radius:50%;animation:spin .8s linear infinite;display:none}.btn.loading .spinner{display:inline-block}.btn.loading .btn-text{display:none}@keyframes spin{to{transform:rotate(360deg)}}.security-dashboard{background:linear-gradient(135deg,#16213e 0%,#1a1a2e 100%);border:1px solid #2d4a6f}.security-score{display:flex;align-items:center;gap:20px;margin-bottom:15px}.score-circle{width:80px;height:80px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:2em;font-weight:bold;border:4px solid}.score-label{font-size:.9em;color:#888}.score-desc{font-size:.75em;color:#666;margin-top:4px}.security-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(100px,1fr));gap:10px;margin-bottom:15px}.security-stat{background:#0d1b2a;padding:12px;border-radius:8px;text-align:center}.security-stat-value{font-size:1.4em;font-weight:bold}.security-stat-label{font-size:.7em;color:#888;margin-top:4px}.entry-points{background:#0d1b2a;border-radius:8px;padding:12px;margin-bottom:12px}.entry-points-title{font-weight:600;margin-bottom:10px;font-size:.85em;color:#888}.entry-point{display:inline-flex;align-items:center;gap:6px;padding:6px 12px;background:#16213e;border-radius:6px;margin-right:8px;margin-bottom:6px;font-size:.85em}.entry-point-dot{width:8px;height:8px;border-radius:50%}.last-attack{background:#0d1b2a;border-radius:8px;padding:10px 12px;margin-bottom:12px;font-size:.8em;color:#888}.last-attack span{color:#e67e22}@media(max-width:480px){body{padding:10px}.metric-value{font-size:1.5em}.btn{padding:12px 10px}.app-metrics{grid-template-columns:repeat(3,1fr)}.score-circle{width:60px;height:60px;font-size:1.5em}}</style></head><body><div class="header"><h1>Server Control</h1><div class="header-links"><a href="/">Refresh</a> <a href="/logout">Logout</a></div></div><div class="metrics"><div class="metric"><div class="metric-value {{if lt .Metrics.CPUPercent 50.0}}green{{else if lt .Metrics.CPUPercent 80.0}}yellow{{else}}red{{end}}">{{printf "%.0f" .Metrics.CPUPercent}}%</div><div class="metric-label">CPU</div><div class="metric-sub">Load: {{.Metrics.LoadAvg}}</div></div><div class="metric"><div class="metric-value {{if lt .Metrics.MemPercent 70.0}}green{{else if lt .Metrics.MemPercent 90.0}}yellow{{else}}red{{end}}">{{printf "%.0f" .Metrics.MemPercent}}%</div><div class="metric-label">RAM</div><div class="metric-sub">{{printf "%.1f" .Metrics.MemUsedGB}}/{{printf "%.1f" .Metrics.MemTotalGB}} GB</div></div><div class="metric"><div class="metric-value {{if lt .Metrics.DiskPercent 70.0}}green{{else if lt .Metrics.DiskPercent 90.0}}yellow{{else}}red{{end}}">{{printf "%.0f" .Metrics.DiskPercent}}%</div><div class="metric-label">Disk</div><div class="metric-sub">{{printf "%.0f" .Metrics.DiskUsedGB}}/{{printf "%.0f" .Metrics.DiskTotalGB}} GB</div></div><div class="metric"><div class="metric-value green">{{.Metrics.Uptime}}</div><div class="metric-label">Uptime</div></div></div><div class="apps">{{range .Apps}}<div class="app {{if .App.IsSecurityDashboard}}security-dashboard{{end}}"><div class="app-header"><span class="app-name">{{if .App.IsSecurityDashboard}}🛡️ {{end}}{{.App.Name}}</span><span class="status {{.Status}}">{{.Status}}</span></div><div class="app-desc">{{.App.Description}} <span style="color:#555;font-size:.75em;margin-left:8px">refreshed @{{.RefreshTime}} IST</span></div>{{if .App.IsSecurityDashboard}}{{if .Security}}<div class="security-score"><div class="score-circle" style="border-color:{{.Security.ScoreColor}};color:{{.Security.ScoreColor}}">{{.Security.SafetyScore}}</div><div><div class="score-label">Safety Score</div><div class="score-desc">{{if ge .Security.SafetyScore 8}}Server is well protected{{else if ge .Security.SafetyScore 5}}Moderate risk detected{{else}}High risk - action needed{{end}}</div></div></div><div class="security-grid"><div class="security-stat"><div class="security-stat-value" style="color:#e74c3c">{{.Security.BannedNow}}</div><div class="security-stat-label">Banned Now</div></div><div class="security-stat"><div class="security-stat-value" style="color:#9b59b6">{{.Security.BannedTotal}}</div><div class="security-stat-label">Total Banned</div></div><div class="security-stat"><div class="security-stat-value" style="color:#f39c12">{{.Security.Probes24h}}</div><div class="security-stat-label">Probes 24h</div></div><div class="security-stat"><div class="security-stat-value" style="color:#00b894">{{.Security.Blocked24h}}</div><div class="security-stat-label">Blocked 24h</div></div><div class="security-stat"><div class="security-stat-value" style="color:#e67e22">{{.Security.UniqueAttackers}}</div><div class="security-stat-label">Attackers</div></div><div class="security-stat"><div class="security-stat-value" style="color:#74b9ff">{{.Security.SSHFails24h}}</div><div class="security-stat-label">SSH Fails</div></div></div><div class="entry-points"><div class="entry-points-title">Entry Points</div>{{range .Security.EntryPoints}}<span class="entry-point"><span class="entry-point-dot" style="background:{{.Color}}"></span><span style="color:{{.Color}}">{{.Name}}</span></span>{{end}}</div>{{if .Security.LastAttackAgo}}<div class="last-attack">Last probe: <span>{{.Security.LastAttackAgo}}</span></div>{{end}}{{end}}{{else}}{{if or (gt .ProcCount 0) (gt .MemMB 0.0)}}<div class="app-stats">{{if gt .ProcCount 0}}<span>CPU: {{printf "%.1f" .CPUPercent}}%</span>{{end}}{{if gt .MemMB 0.0}}<span>RAM: {{printf "%.0f" .MemMB}} MB</span>{{end}}{{if gt .ProcCount 0}}<span>Procs: {{.ProcCount}}</span>{{end}}</div>{{end}}{{if .Metrics}}<div class="app-metrics">{{range .Metrics}}{{if not (contains .Label "URLs")}}<div class="app-metric"><div class="app-metric-value" {{if .Color}}style="color: {{.Color}}"{{end}}>{{.Value | safeHTML}}</div><div class="app-metric-label">{{.Label}}</div></div>{{end}}{{end}}</div>{{if hasURLMetrics .Metrics}}<div class="error-urls"><div class="error-urls-title">Error Details (24h)</div>{{range .Metrics}}{{if contains .Label "URLs"}}<div class="error-urls-row"><span class="error-urls-label" {{if .Color}}style="color:{{.Color}}"{{end}}>{{.Label}}:</span><span class="error-urls-value">{{.Value}}</span></div>{{end}}{{end}}</div>{{end}}{{end}}{{if .App.LogPattern}}<div class="error-section"><div class="error-section-title">Error URLs (24h)</div>{{if .ErrorURLs}}{{range .ErrorURLs}}<div class="error-row"><span class="error-type" style="color:{{errorColor .Type}}">{{.Type}}</span><span class="error-url">{{.URL}}</span><span class="error-meta"><span style="color:#e67e22;font-weight:600">[{{.TimeAgo}}]</span> <span style="color:#74b9ff">@{{.LastTime}} IST</span> ({{.Count}})</span></div>{{end}}{{else}}<div style="color:#27ae60;font-size:.85em">✓ No errors</div>{{end}}</div>{{end}}{{if .CanScale}}<div class="worker-control"><span>Workers:</span><form method="POST" action="/action" style="display:inline"><input type="hidden" name="app" value="{{.App.Name}}"><input type="hidden" name="action" value="remove_worker"><button type="submit" class="worker-btn remove" {{if le .WorkerCount .App.WorkerMin}}disabled{{end}} title="Remove worker (min: {{.App.WorkerMin}})">−</button></form><span class="worker-count">{{.WorkerCount}}</span><form method="POST" action="/action" style="display:inline"><input type="hidden" name="app" value="{{.App.Name}}"><input type="hidden" name="action" value="add_worker"><button type="submit" class="worker-btn add" {{if ge .WorkerCount .App.WorkerMax}}disabled{{end}} title="Add worker (max: {{.App.WorkerMax}})">+</button></form><span style="font-size:.65em;color:#555;margin-left:auto">~10 req/min per worker • max {{.App.WorkerMax}}</span></div>{{end}}{{end}}{{if .App.Deps}}<div class="deps">{{range .App.Deps}}{{.}} • {{end}}</div>{{end}}<div class="actions"><form method="POST" action="/action" class="action-form" style="flex:1;display:flex"><input type="hidden" name="app" value="{{.App.Name}}"><input type="hidden" name="action" value="start"><button class="btn btn-start" style="flex:1" {{if eq .Status "running"}}disabled{{end}}><span class="spinner"></span><span class="btn-text">{{if .App.IsSecurityDashboard}}Enable{{else}}Start{{end}}</span></button></form><form method="POST" action="/action" class="action-form" style="flex:1;display:flex"><input type="hidden" name="app" value="{{.App.Name}}"><input type="hidden" name="action" value="stop"><button class="btn btn-stop" style="flex:1" {{if eq .Status "stopped"}}disabled{{end}}><span class="spinner"></span><span class="btn-text">{{if .App.IsSecurityDashboard}}Disable{{else}}Stop{{end}}</span></button></form><form method="POST" action="/action" class="action-form" style="flex:1;display:flex"><input type="hidden" name="app" value="{{.App.Name}}"><input type="hidden" name="action" value="restart"><button class="btn btn-restart" style="flex:1"><span class="spinner"></span><span class="btn-text">Restart</span></button></form></div></div>{{end}}</div><script>document.querySelectorAll(".action-form").forEach(function(f){f.addEventListener("submit",function(e){var b=f.querySelector(".btn");if(b.disabled||b.classList.contains("loading")){e.preventDefault();return}b.classList.add("loading");document.querySelectorAll(".btn").forEach(function(x){if(!x.classList.contains("loading"))x.disabled=true})})})</script></body></html>`
+	tmpl := `<!DOCTYPE html><html><head><title>Server Control</title><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="30"><style>*{box-sizing:border-box}body{font-family:-apple-system,sans-serif;background:#1a1a2e;color:#eee;margin:0;padding:15px}h1{color:#e94560;font-size:1.4em;margin:0 0 15px}.header{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;margin-bottom:15px}.header-links a{color:#74b9ff;text-decoration:none;margin-left:15px;font-size:.9em}.metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;margin-bottom:20px}.metric{background:#16213e;padding:15px;border-radius:10px;text-align:center}.metric-value{font-size:1.8em;font-weight:bold}.metric-label{font-size:.75em;color:#888;margin-top:5px}.metric-sub{font-size:.7em;color:#666}.green{color:#00b894}.yellow{color:#fdcb6e}.red{color:#e74c3c}.apps{display:grid;gap:12px}.app{background:#16213e;padding:15px;border-radius:10px}.app-header{display:flex;justify-content:space-between;align-items:flex-start;gap:10px;margin-bottom:10px}.app-name{font-size:1.1em;font-weight:600;color:#74b9ff;flex:1}.status{padding:4px 12px;border-radius:15px;font-size:.75em;font-weight:600}.status.running{background:#00b894}.status.stopped{background:#d63031}.app-desc{color:#a0a0a0;font-size:.85em;margin-bottom:10px}.app-stats{display:flex;gap:10px;font-size:.8em;color:#888;margin-bottom:12px;flex-wrap:wrap}.app-stats span{background:#0d1b2a;padding:4px 10px;border-radius:5px}.app-metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(90px,1fr));gap:8px;margin-bottom:12px}.error-urls{background:#0d1b2a;border-radius:8px;padding:10px 12px;margin-bottom:12px;font-size:.75em}.error-urls-title{font-weight:600;margin-bottom:6px}.error-urls-row{display:flex;gap:8px;margin-bottom:4px;align-items:baseline}.error-urls-label{min-width:60px;font-weight:500}.error-urls-value{color:#aaa;word-break:break-all}.error-section{background:#0d1b2a;border-radius:8px;padding:12px;margin-bottom:12px;width:100%}.error-section-title{font-weight:600;margin-bottom:8px;font-size:.85em;color:#888}.error-row{display:flex;gap:12px;margin-bottom:6px;font-size:.8em;align-items:baseline}.error-type{min-width:40px;font-weight:600}.error-url{flex:1;color:#aaa;word-break:break-all;font-family:monospace;font-size:.9em}.error-meta{color:#666;white-space:nowrap;font-size:.9em}.app-metric{background:#0d1b2a;padding:10px 8px;border-radius:8px;text-align:center}.app-metric-value{font-size:1.3em;font-weight:bold;color:#fff}.app-metric-label{font-size:.65em;color:#888;margin-top:3px}.worker-control{display:flex;align-items:center;gap:8px;background:#0d1b2a;padding:8px 12px;border-radius:8px;margin-bottom:12px}.worker-control span{font-size:.85em;color:#9b59b6}.worker-btn{width:28px;height:28px;border:none;border-radius:6px;cursor:pointer;font-size:1.1em;font-weight:bold;display:flex;align-items:center;justify-content:center}.worker-btn.add{background:#27ae60;color:white}.worker-btn.remove{background:#e74c3c;color:white}.worker-btn:disabled{opacity:.3;cursor:not-allowed}.worker-count{font-size:1.2em;font-weight:bold;color:#9b59b6;min-width:20px;text-align:center}.deps{font-size:.75em;color:#636e72;margin-bottom:12px}.actions{display:flex;gap:8px;flex-wrap:wrap}.btn{padding:10px 18px;border:none;border-radius:6px;cursor:pointer;font-size:.85em;font-weight:600;flex:1;min-width:80px;display:flex;align-items:center;justify-content:center;gap:8px}.btn-start{background:#00b894;color:white}.btn-stop{background:#d63031;color:white}.btn-restart{background:#fdcb6e;color:#333}.btn:disabled{opacity:.4;cursor:not-allowed}.btn.loading{opacity:.7;cursor:wait}.spinner{width:14px;height:14px;border:2px solid transparent;border-top-color:currentColor;border-radius:50%;animation:spin .8s linear infinite;display:none}.btn.loading .spinner{display:inline-block}.btn.loading .btn-text{display:none}@keyframes spin{to{transform:rotate(360deg)}}.security-dashboard{background:linear-gradient(135deg,#16213e 0%,#1a1a2e 100%);border:1px solid #2d4a6f}.security-score{display:flex;align-items:center;gap:20px;margin-bottom:15px}.score-circle{width:80px;height:80px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:2em;font-weight:bold;border:4px solid}.score-label{font-size:.9em;color:#888}.score-desc{font-size:.75em;color:#666;margin-top:4px}.security-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(100px,1fr));gap:10px;margin-bottom:15px}.security-stat{background:#0d1b2a;padding:12px;border-radius:8px;text-align:center}.security-stat-value{font-size:1.4em;font-weight:bold}.security-stat-label{font-size:.7em;color:#888;margin-top:4px}.entry-points{background:#0d1b2a;border-radius:8px;padding:12px;margin-bottom:12px}.entry-points-title{font-weight:600;margin-bottom:10px;font-size:.85em;color:#888}.entry-point{display:inline-flex;align-items:center;gap:6px;padding:6px 12px;background:#16213e;border-radius:6px;margin-right:8px;margin-bottom:6px;font-size:.85em}.entry-point-dot{width:8px;height:8px;border-radius:50%}.last-attack{background:#0d1b2a;border-radius:8px;padding:10px 12px;margin-bottom:12px;font-size:.8em;color:#888}.last-attack span{color:#e67e22}@media(max-width:480px){body{padding:10px}.metric-value{font-size:1.5em}.btn{padding:12px 10px}.app-metrics{grid-template-columns:repeat(3,1fr)}.score-circle{width:60px;height:60px;font-size:1.5em}}</style></head><body><div class="header"><h1>Server Control</h1><div class="header-links"><a href="/">Refresh</a> <a href="/logout">Logout</a></div></div><div class="metrics"><div class="metric"><div class="metric-value {{if lt .Metrics.CPUPercent 50.0}}green{{else if lt .Metrics.CPUPercent 80.0}}yellow{{else}}red{{end}}">{{printf "%.0f" .Metrics.CPUPercent}}%</div><div class="metric-label">CPU</div><div class="metric-sub">Load: {{.Metrics.LoadAvg}}</div></div><div class="metric"><div class="metric-value {{if lt .Metrics.MemPercent 70.0}}green{{else if lt .Metrics.MemPercent 90.0}}yellow{{else}}red{{end}}">{{printf "%.0f" .Metrics.MemPercent}}%</div><div class="metric-label">RAM</div><div class="metric-sub">{{printf "%.1f" .Metrics.MemUsedGB}}/{{printf "%.1f" .Metrics.MemTotalGB}} GB</div></div><div class="metric"><div class="metric-value {{if lt .Metrics.DiskPercent 70.0}}green{{else if lt .Metrics.DiskPercent 90.0}}yellow{{else}}red{{end}}">{{printf "%.0f" .Metrics.DiskPercent}}%</div><div class="metric-label">Disk</div><div class="metric-sub">{{printf "%.0f" .Metrics.DiskUsedGB}}/{{printf "%.0f" .Metrics.DiskTotalGB}} GB</div></div><div class="metric"><div class="metric-value green">{{.Metrics.Uptime}}</div><div class="metric-label">Uptime</div></div></div><div class="apps">{{range .Apps}}<div class="app {{if .App.IsSecurityDashboard}}security-dashboard{{end}}"><div class="app-header"><span class="app-name">{{if .App.IsSecurityDashboard}}🛡️ {{end}}{{.App.Name}}</span><span class="status {{.Status}}">{{.Status}}</span></div><div class="app-desc">{{.App.Description}} <span style="color:#555;font-size:.75em;margin-left:8px">refreshed @{{.RefreshTime}} IST</span></div>{{if .App.IsSecurityDashboard}}{{if .Security}}<div class="security-score"><div class="score-circle" style="border-color:{{.Security.ScoreColor}};color:{{.Security.ScoreColor}}">{{.Security.SafetyScore}}</div><div><div class="score-label">Safety Score</div><div class="score-desc">{{if ge .Security.SafetyScore 8}}Server is well protected{{else if ge .Security.SafetyScore 5}}Moderate risk detected{{else}}High risk - action needed{{end}}</div></div></div><div class="security-grid"><div class="security-stat"><div class="security-stat-value" style="color:#e74c3c">{{.Security.BannedNow}}</div><div class="security-stat-label">Banned Now</div></div><div class="security-stat"><div class="security-stat-value" style="color:#9b59b6">{{.Security.BannedTotal}}</div><div class="security-stat-label">Total Banned</div></div><div class="security-stat"><div class="security-stat-value" style="color:#f39c12">{{.Security.Probes24h}}</div><div class="security-stat-label">Probes 24h</div></div><div class="security-stat"><div class="security-stat-value" style="color:#00b894">{{.Security.Blocked24h}}</div><div class="security-stat-label">Blocked 24h</div></div><div class="security-stat"><div class="security-stat-value" style="color:#e67e22">{{.Security.UniqueAttackers}}</div><div class="security-stat-label">Attackers</div></div><div class="security-stat"><div class="security-stat-value" style="color:#74b9ff">{{.Security.SSHFails24h}}</div><div class="security-stat-label">SSH Fails</div></div></div><div class="entry-points"><div class="entry-points-title">Entry Points</div>{{range .Security.EntryPoints}}<span class="entry-point"><span class="entry-point-dot" style="background:{{.Color}}"></span><span style="color:{{.Color}}">{{.Name}}</span></span>{{end}}</div>{{if .Security.LastAttackAgo}}<div class="last-attack">Last probe: <span>{{.Security.LastAttackAgo}}</span></div>{{end}}{{end}}{{else}}{{if or (gt .ProcCount 0) (gt .MemMB 0.0)}}<div class="app-stats">{{if gt .ProcCount 0}}<span>CPU: {{printf "%.1f" .CPUPercent}}%</span>{{end}}{{if gt .MemMB 0.0}}<span>RAM: {{printf "%.0f" .MemMB}} MB</span>{{end}}{{if gt .ProcCount 0}}<span>Procs: {{.ProcCount}}</span>{{end}}</div>{{end}}{{if .Metrics}}<div class="app-metrics">{{range .Metrics}}{{if not (contains .Label "URLs")}}<div class="app-metric"><div class="app-metric-value" {{if .Color}}style="color: {{.Color}}"{{end}}>{{.Value | safeHTML}}</div><div class="app-metric-label">{{.Label}}</div></div>{{end}}{{end}}</div>{{if hasURLMetrics .Metrics}}<div class="error-urls"><div class="error-urls-title">Error Details (24h)</div>{{range .Metrics}}{{if contains .Label "URLs"}}<div class="error-urls-row"><span class="error-urls-label" {{if .Color}}style="color:{{.Color}}"{{end}}>{{.Label}}:</span><span class="error-urls-value">{{.Value}}</span></div>{{end}}{{end}}</div>{{end}}{{end}}{{if .App.LogPattern}}<div class="error-section"><div class="error-section-title">Error URLs (24h)</div>{{if .ErrorURLs}}{{range .ErrorURLs}}<div class="error-row"><span class="error-type" style="color:{{errorColor .Type}}">{{.Type}}</span><span class="error-url">{{.URL}}</span><span class="error-meta"><span style="color:#e67e22;font-weight:600">[{{.TimeAgo}}]</span> <span style="color:#74b9ff">@{{.LastTime}} IST</span> ({{.Count}})</span></div>{{end}}{{else}}<div style="color:#27ae60;font-size:.85em">✓ No errors</div>{{end}}</div>{{end}}{{if .CanScale}}<div class="worker-control"><span>Workers:</span><form method="POST" action="/action" style="display:inline"><input type="hidden" name="app" value="{{.App.Name}}"><input type="hidden" name="action" value="remove_worker"><button type="submit" class="worker-btn remove" {{if le .WorkerCount .App.WorkerMin}}disabled{{end}} {{if and .AutoScale .AutoScale.Enabled}}disabled title="Disabled during auto-scale"{{else}}title="Remove worker (min: {{.App.WorkerMin}})"{{end}}>−</button></form><span class="worker-count">{{.WorkerCount}}</span><form method="POST" action="/action" style="display:inline"><input type="hidden" name="app" value="{{.App.Name}}"><input type="hidden" name="action" value="add_worker"><button type="submit" class="worker-btn add" {{if ge .WorkerCount .App.WorkerMax}}disabled{{end}} {{if and .AutoScale .AutoScale.Enabled}}disabled title="Disabled during auto-scale"{{else}}title="Add worker (max: {{.App.WorkerMax}})"{{end}}>+</button></form><span style="font-size:.65em;color:#555;margin-left:auto">{{if and .AutoScale .AutoScale.Enabled}}⚡ Auto{{else}}Manual{{end}} • max {{.App.WorkerMax}}</span></div><div class="autoscale-card" style="background:linear-gradient(135deg,#0d1b2a 0%,#16213e 100%);border:1px solid {{if and .AutoScale .AutoScale.Enabled}}#00b894{{else}}#444{{end}};border-radius:8px;padding:12px;margin-bottom:12px"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px"><span style="font-weight:600;color:{{if and .AutoScale .AutoScale.Enabled}}#00b894{{else}}#888{{end}}">⚡ Auto-Scaling</span><form method="POST" action="/autoscale" style="margin:0"><input type="hidden" name="app" value="{{.App.Name}}">{{if and .AutoScale .AutoScale.Enabled}}<input type="hidden" name="enable" value="false"><button type="submit" style="background:#e74c3c;color:white;border:none;padding:6px 14px;border-radius:5px;cursor:pointer;font-size:.8em;font-weight:600">Disable</button>{{else}}<input type="hidden" name="enable" value="true"><button type="submit" style="background:#00b894;color:white;border:none;padding:6px 14px;border-radius:5px;cursor:pointer;font-size:.8em;font-weight:600">Enable</button>{{end}}</form></div>{{if and .AutoScale .AutoScale.Enabled}}<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;font-size:.75em"><div style="background:#1a1a2e;padding:8px;border-radius:6px;text-align:center"><div style="font-size:1.3em;font-weight:bold;color:#74b9ff">{{printf "%.1f" .AutoScale.LastReqRate}}</div><div style="color:#666;margin-top:2px">Req/min</div></div><div style="background:#1a1a2e;padding:8px;border-radius:6px;text-align:center"><div style="font-size:1.3em;font-weight:bold;color:#9b59b6">{{.AutoScale.TargetWorkers}}</div><div style="color:#666;margin-top:2px">Target</div></div><div style="background:#1a1a2e;padding:8px;border-radius:6px;text-align:center"><div style="font-size:1.3em;font-weight:bold;color:{{if eq .AutoScale.LastAction "scale_up"}}#27ae60{{else if eq .AutoScale.LastAction "scale_down"}}#e67e22{{else if eq .AutoScale.LastAction "resource_limited"}}#e74c3c{{else}}#00b894{{end}}">{{if eq .AutoScale.LastAction "scale_up"}}↑{{else if eq .AutoScale.LastAction "scale_down"}}↓{{else if eq .AutoScale.LastAction "optimal"}}✓{{else if eq .AutoScale.LastAction "resource_limited"}}!{{else}}-{{end}}</div><div style="color:#666;margin-top:2px">Status</div></div></div><div style="font-size:.7em;color:#555;margin-top:8px;text-align:center">Scales when &gt;8 or &lt;2 req/min per worker • Checks CPU/RAM</div>{{else}}<div style="font-size:.8em;color:#666;text-align:center">Enable to auto-adjust workers based on request load</div>{{end}}</div>{{end}}{{end}}{{if .App.Deps}}<div class="deps">{{range .App.Deps}}{{.}} • {{end}}</div>{{end}}<div class="actions"><form method="POST" action="/action" class="action-form" style="flex:1;display:flex"><input type="hidden" name="app" value="{{.App.Name}}"><input type="hidden" name="action" value="start"><button class="btn btn-start" style="flex:1" {{if eq .Status "running"}}disabled{{end}}><span class="spinner"></span><span class="btn-text">{{if .App.IsSecurityDashboard}}Enable{{else}}Start{{end}}</span></button></form><form method="POST" action="/action" class="action-form" style="flex:1;display:flex"><input type="hidden" name="app" value="{{.App.Name}}"><input type="hidden" name="action" value="stop"><button class="btn btn-stop" style="flex:1" {{if eq .Status "stopped"}}disabled{{end}}><span class="spinner"></span><span class="btn-text">{{if .App.IsSecurityDashboard}}Disable{{else}}Stop{{end}}</span></button></form><form method="POST" action="/action" class="action-form" style="flex:1;display:flex"><input type="hidden" name="app" value="{{.App.Name}}"><input type="hidden" name="action" value="restart"><button class="btn btn-restart" style="flex:1"><span class="spinner"></span><span class="btn-text">Restart</span></button></form></div></div>{{end}}</div><script>document.querySelectorAll(".action-form").forEach(function(f){f.addEventListener("submit",function(e){var b=f.querySelector(".btn");if(b.disabled||b.classList.contains("loading")){e.preventDefault();return}b.classList.add("loading");document.querySelectorAll(".btn").forEach(function(x){if(!x.classList.contains("loading"))x.disabled=true})})})</script></body></html>`
 	t := template.Must(template.New("index").Funcs(funcMap).Parse(tmpl))
 	t.Execute(w, data)
 }
@@ -672,6 +861,33 @@ func actionHandler(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
+func autoScaleToggleHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" { http.Redirect(w, r, "/", http.StatusSeeOther); return }
+	appName := r.FormValue("app")
+	enable := r.FormValue("enable") == "true"
+
+	// Verify app exists and supports scaling
+	var app *App
+	for _, a := range config.Apps {
+		if a.Name == appName {
+			app = &a
+			break
+		}
+	}
+	if app == nil {
+		http.Error(w, "App not found", http.StatusNotFound)
+		return
+	}
+	if app.WorkerPidCmd == "" && app.WorkerAddCmd == "" {
+		http.Error(w, "App does not support scaling", http.StatusBadRequest)
+		return
+	}
+
+	setAutoScaleEnabled(appName, enable)
+	log.Printf("[AutoScale] %s: auto-scaling %s", appName, map[bool]string{true: "enabled", false: "disabled"}[enable])
+	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
 func logoutHandler(w http.ResponseWriter, r *http.Request) {
 	http.SetCookie(w, &http.Cookie{Name: "session", Value: "", Path: "/", MaxAge: -1})
 	http.Redirect(w, r, "/login", http.StatusSeeOther)
@@ -683,6 +899,7 @@ func main() {
 	http.HandleFunc("/logout", logoutHandler)
 	http.HandleFunc("/", basicAuth(indexHandler))
 	http.HandleFunc("/action", basicAuth(actionHandler))
+	http.HandleFunc("/autoscale", basicAuth(autoScaleToggleHandler))
 	addr := fmt.Sprintf(":%d", config.Port)
 	log.Printf("Server Control starting on %s", addr)
 	log.Fatal(http.ListenAndServe(addr, nil))
