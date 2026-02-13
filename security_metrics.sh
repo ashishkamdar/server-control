@@ -19,7 +19,8 @@ get_fail2ban() {
 get_ssh_fails() {
     local count=0
     if [ -f /var/log/auth.log ]; then
-        count=$(grep -c "sshd.*Failed password\|sshd.*Invalid user" /var/log/auth.log 2>/dev/null | head -1 || echo 0)
+        # Count failures from last 24 hours using journalctl
+        count=$(journalctl -u ssh --since "24 hours ago" 2>/dev/null | grep -c "Failed password\|Invalid user" || grep "$(date +%Y-%m-%d)" /var/log/auth.log 2>/dev/null | grep -c "Failed password\|Invalid user" || echo 0)
     fi
     echo "$count"
 }
