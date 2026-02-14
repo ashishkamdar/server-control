@@ -1,4 +1,4 @@
-#\!/bin/bash
+#!/bin/bash
 # Metrics for hetalkamdar.com (Traffic + Security)
 
 # Last 1 hour
