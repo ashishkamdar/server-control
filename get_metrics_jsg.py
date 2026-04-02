@@ -24,9 +24,13 @@ def get_metrics():
                                if f.endswith(".html") and "_admin" not in f])
 
         # Last 24 hours lookups
+        recent_lookups = 0
         yesterday = (datetime.now() - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
-        cur.execute("SELECT COUNT(*) FROM ticket_access_logs WHERE accessed_at >= ?", (yesterday,))
-        recent_lookups = cur.fetchone()[0]
+        try:
+            cur.execute("SELECT COUNT(*) FROM ticket_access_logs WHERE accessed_at >= ?", (yesterday,))
+            recent_lookups = cur.fetchone()[0]
+        except sqlite3.OperationalError:
+            pass
 
         conn.close()
 
