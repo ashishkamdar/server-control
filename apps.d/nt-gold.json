@@ -1,0 +1,16 @@
+{
+  "name": "NT Precious Metals",
+  "description": "Niyam Turakhia — Precious Metals MIS Dashboard (Next.js + SQLite) [:3020]",
+  "workdir": "/var/www/nt-metals",
+  "start_cmd": "export HOME=/root PM2_HOME=/root/.pm2; cd /var/www/nt-metals && /usr/bin/pm2 start npm --name nt-metals -- start",
+  "stop_cmd": "export HOME=/root PM2_HOME=/root/.pm2; /usr/bin/pm2 stop nt-metals",
+  "status_cmd": "export HOME=/root PM2_HOME=/root/.pm2; test -n \"$(/usr/bin/pm2 pid nt-metals 2>/dev/null | head -1)\" && test \"$(/usr/bin/pm2 pid nt-metals 2>/dev/null | head -1)\" != \"0\" && echo running",
+  "proc_match": "nt-metals",
+  "deps": [
+    "Node.js",
+    "PM2",
+    "SQLite"
+  ],
+  "metrics_cmd": "/opt/server-control/nt_gold_metrics.sh",
+  "log_pattern": "nt.areakpi.in"
+}

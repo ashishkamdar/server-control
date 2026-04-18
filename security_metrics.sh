@@ -1,138 +1,143 @@
 #!/bin/bash
-# Security Dashboard Metrics - Lightweight security status
+# Security Dashboard Metrics - Optimized: parallel sections + fast cgroup-based orphan detection
 
-# Get fail2ban stats
-get_fail2ban() {
-    local banned=0 total_banned=0
+TMPDIR=$(mktemp -d)
+trap "rm -rf $TMPDIR" EXIT
+
+# === PARALLEL: Launch all independent data gathering ===
+
+# 1. fail2ban stats
+(
+    banned=0; total_banned=0
     if command -v fail2ban-client &>/dev/null; then
-        banned=$(fail2ban-client status 2>/dev/null | grep -oP "Currently banned:\s*\K\d+" | awk "{s+=\$1} END {print s+0}" 2>/dev/null || echo 0)
-        # Get total from all jails
-        for jail in $(fail2ban-client status 2>/dev/null | grep "Jail list:" | sed "s/.*://;s/,//g"); do
+        status_out=$(fail2ban-client status 2>/dev/null)
+        banned=$(echo "$status_out" | grep -oP "Currently banned:\s*\K\d+" | awk "{s+=\$1} END {print s+0}" 2>/dev/null || echo 0)
+        for jail in $(echo "$status_out" | grep "Jail list:" | sed "s/.*://;s/,//g"); do
             jban=$(fail2ban-client status "$jail" 2>/dev/null | grep -oP "Total banned:\s*\K\d+" || echo 0)
             total_banned=$((total_banned + jban))
         done
     fi
-    echo "$banned|$total_banned"
-}
+    echo "$banned|$total_banned" > "$TMPDIR/f2b"
+) &
 
-# Get SSH failed attempts (last 24h)
-get_ssh_fails() {
-    local count=0
-    if [ -f /var/log/auth.log ]; then
-        # Count failures from last 24 hours using journalctl
-        count=$(journalctl -u ssh --since "24 hours ago" 2>/dev/null | grep -c "Failed password\|Invalid user" || grep "$(date +%Y-%m-%d)" /var/log/auth.log 2>/dev/null | grep -c "Failed password\|Invalid user" || echo 0)
+# 2. SSH fails (24h)
+(
+    count=$(journalctl -u ssh --since "24 hours ago" 2>/dev/null | grep -c "Failed password\|Invalid user" 2>/dev/null) || count=0
+    if [ "$count" -eq 0 ] 2>/dev/null && [ -f /var/log/auth.log ]; then
+        count=$(grep "$(date +%Y-%m-%d)" /var/log/auth.log 2>/dev/null | grep -c "Failed password\|Invalid user" 2>/dev/null) || count=0
     fi
-    echo "$count"
-}
+    echo "${count:-0}" > "$TMPDIR/ssh"
+) &
 
-# Get nginx probe attempts (last 24h) - quick scan
-get_nginx_probes() {
-    local today=$(date +"%d/%b/%Y")
-    local yesterday=$(date -d "yesterday" +"%d/%b/%Y" 2>/dev/null || date -v-1d +"%d/%b/%Y")
-    local count=0
-    
-    # Quick grep for common probe patterns
+# 3. Nginx log analysis — ONE pass for probes, attackers, blocked, last_attack
+(
+    today=$(date +"%d/%b/%Y")
+    yesterday=$(date -d "yesterday" +"%d/%b/%Y" 2>/dev/null || date -v-1d +"%d/%b/%Y")
+    probes=0; attackers=0; blocked=0; last_attack="None"
     if [ -f /var/log/nginx/access.log ]; then
-        count=$(grep -E "($today|$yesterday).*(\\.env|wp-login|phpMyAdmin|\\.git|xmlrpc|/admin|/config)" /var/log/nginx/access.log 2>/dev/null | wc -l || echo 0)
+        relevant=$(grep -E "($today|$yesterday)" /var/log/nginx/access.log 2>/dev/null)
+        probes=$(echo "$relevant" | grep -cE "(\.env|wp-login|phpMyAdmin|\.git|xmlrpc|/admin|/config)" 2>/dev/null || echo 0)
+        blocked=$(echo "$relevant" | grep -cE "(\" 444 |\" 403 )" 2>/dev/null || echo 0)
+        attackers=$(echo "$relevant" | grep -E "(\" 403 |\" 444 |\.env|\.git|wp-login|phpMyAdmin)" 2>/dev/null | awk '{print $1}' | sort -u | wc -l || echo 0)
+        last=$(grep -E "(\.env|\.git|wp-login|phpMyAdmin|xmlrpc)" /var/log/nginx/access.log 2>/dev/null | tail -1 | grep -oP "\[\K[^\]]+(?=\])" || echo "")
+        [ -n "$last" ] && last_attack="$last"
     fi
-    echo "$count"
-}
+    echo "$probes|$attackers|$blocked|$last_attack" > "$TMPDIR/nginx"
+) &
 
-# Get entry point status
-get_entry_points() {
-    local nginx_status="stopped"
-    local ssh_status="running"
-    local fail2ban_status="stopped"
-    
+# 4. Entry points
+(
+    nginx_status="stopped"; ssh_status="running"; fail2ban_status="stopped"
     systemctl is-active nginx &>/dev/null && nginx_status="running"
     systemctl is-active ssh &>/dev/null && ssh_status="running"
     systemctl is-active fail2ban &>/dev/null && fail2ban_status="running"
-    
-    echo "$nginx_status|$ssh_status|$fail2ban_status"
-}
+    echo "$nginx_status|$ssh_status|$fail2ban_status" > "$TMPDIR/entry"
+) &
 
-# Get unique attacker IPs (last 24h)
-get_attacker_ips() {
-    local count=0
-    local today=$(date +"%d/%b/%Y")
-    local yesterday=$(date -d "yesterday" +"%d/%b/%Y" 2>/dev/null || date -v-1d +"%d/%b/%Y")
-    
-    # From nginx 403/suspicious patterns
-    if [ -f /var/log/nginx/access.log ]; then
-        count=$(grep -E "($today|$yesterday).*(\" 403 |\" 444 |\\.env|\\.git|wp-login|phpMyAdmin)" /var/log/nginx/access.log 2>/dev/null | awk "{print \$1}" | sort -u | wc -l || echo 0)
-    fi
-    echo "$count"
-}
+# 5. Orphan process detection — fast cgroup check instead of systemctl per-pid
+(
+    first=true
+    result="["
+    while IFS= read -r line; do
+        pid=$(echo "$line" | grep -oP 'pid=\K\d+' | head -1)
+        [ -z "$pid" ] && continue
+        [ "$pid" -eq 1 ] 2>/dev/null && continue
 
-# Get blocked requests (nginx 444/403)
-get_blocked() {
-    local today=$(date +"%d/%b/%Y")
-    local yesterday=$(date -d "yesterday" +"%d/%b/%Y" 2>/dev/null || date -v-1d +"%d/%b/%Y")
-    local count=0
-    
-    if [ -f /var/log/nginx/access.log ]; then
-        count=$(grep -E "($today|$yesterday).*(\" 444 |\" 403 )" /var/log/nginx/access.log 2>/dev/null | wc -l || echo 0)
-    fi
-    echo "$count"
-}
+        # Fast: read cgroup to check if systemd-managed
+        cgroup=$(cat /proc/$pid/cgroup 2>/dev/null | head -1)
+        echo "$cgroup" | grep -q "system.slice\|user.slice\|init.scope" && continue
 
-# Get last attack time
-get_last_attack() {
-    local last=""
-    if [ -f /var/log/nginx/access.log ]; then
-        last=$(grep -E "(\\.env|\\.git|wp-login|phpMyAdmin|xmlrpc)" /var/log/nginx/access.log 2>/dev/null | tail -1 | grep -oP "\[\K[^\]]+(?=\])" || echo "")
-    fi
-    [ -z "$last" ] && last="None"
-    echo "$last"
-}
+        name=$(ps -p "$pid" -o comm= 2>/dev/null || echo "unknown")
+        port=$(echo "$line" | awk '{print $5}' | grep -oP ':\K[^:]+$' || echo "?")
+        user=$(ps -p "$pid" -o user= 2>/dev/null || echo "?")
+        mem=$(ps -p "$pid" -o rss= 2>/dev/null || echo "0")
+        mem=$((mem / 1024))
+        elapsed=$(ps -p "$pid" -o etimes= 2>/dev/null | tr -d ' ' || echo "0")
+        if [ "$elapsed" -gt 86400 ] 2>/dev/null; then
+            uptime_str="$((elapsed / 86400))d $((elapsed % 86400 / 3600))h"
+        elif [ "$elapsed" -gt 3600 ] 2>/dev/null; then
+            uptime_str="$((elapsed / 3600))h $((elapsed % 3600 / 60))m"
+        else
+            uptime_str="$((elapsed / 60))m"
+        fi
+        [ "$first" = true ] && first=false || result="$result,"
+        result="$result{\"pid\":$pid,\"name\":\"$name\",\"port\":\"$port\",\"user\":\"$user\",\"memory\":\"${mem} MB\",\"uptime\":\"$uptime_str\"}"
+    done < <(ss -tlnp 2>/dev/null | tail -n +2)
 
-# Calculate safety score (1-10)
-calc_safety_score() {
-    local score=10
-    local banned=$1
-    local ssh_fails=$2
-    local probes=$3
-    local attackers=$4
-    local fail2ban_status=$5
-    
-    # Deductions
-    [ "$fail2ban_status" != "running" ] && score=$((score - 2))  # -2 if fail2ban not running
-    [ "$banned" -gt 0 ] && score=$((score - 1))  # -1 if actively banning (means active attack)
-    [ "$ssh_fails" -gt 50 ] && score=$((score - 1))  # -1 if many SSH failures
-    [ "$ssh_fails" -gt 200 ] && score=$((score - 1))  # -1 more if excessive
-    [ "$probes" -gt 100 ] && score=$((score - 1))  # -1 if many probes
-    [ "$probes" -gt 500 ] && score=$((score - 1))  # -1 more if excessive
-    [ "$attackers" -gt 10 ] && score=$((score - 1))  # -1 if many unique attackers
-    
-    # Ensure 1-10 range
-    [ "$score" -lt 1 ] && score=1
-    [ "$score" -gt 10 ] && score=10
-    
-    echo "$score"
-}
+    # Zombie check
+    while IFS= read -r line; do
+        zpid=$(echo "$line" | awk '{print $2}')
+        zname=$(echo "$line" | awk '{print $11}')
+        [ -z "$zpid" ] && continue
+        [ "$first" = true ] && first=false || result="$result,"
+        result="$result{\"pid\":$zpid,\"name\":\"$zname [zombie]\",\"port\":\"-\",\"user\":\"$(echo "$line" | awk '{print $1}')\",\"memory\":\"0 MB\",\"uptime\":\"-\"}"
+    done < <(ps aux 2>/dev/null | awk '$8 ~ /^Z/ {print}')
 
-# Main
-fail2ban_data=$(get_fail2ban)
-banned=$(echo "$fail2ban_data" | cut -d"|" -f1)
-total_banned=$(echo "$fail2ban_data" | cut -d"|" -f2)
+    result="$result]"
+    echo "$result" > "$TMPDIR/orphans"
+) &
 
-entry_points=$(get_entry_points)
-nginx_status=$(echo "$entry_points" | cut -d"|" -f1)
-ssh_status=$(echo "$entry_points" | cut -d"|" -f2)
-fail2ban_status=$(echo "$entry_points" | cut -d"|" -f3)
+# === WAIT ===
+wait
 
-ssh_fails=$(get_ssh_fails)
-probes=$(get_nginx_probes)
-attackers=$(get_attacker_ips)
-blocked=$(get_blocked)
-last_attack=$(get_last_attack)
+# === READ results ===
+f2b=$(cat "$TMPDIR/f2b" 2>/dev/null || echo "0|0")
+banned=$(echo "$f2b" | cut -d"|" -f1)
+total_banned=$(echo "$f2b" | cut -d"|" -f2)
 
-safety_score=$(calc_safety_score "$banned" "$ssh_fails" "$probes" "$attackers" "$fail2ban_status")
+ssh_fails=$(cat "$TMPDIR/ssh" 2>/dev/null || echo "0")
 
-# Output JSON
+nginx_data=$(cat "$TMPDIR/nginx" 2>/dev/null || echo "0|0|0|None")
+probes=$(echo "$nginx_data" | cut -d"|" -f1)
+attackers=$(echo "$nginx_data" | cut -d"|" -f2)
+blocked=$(echo "$nginx_data" | cut -d"|" -f3)
+last_attack=$(echo "$nginx_data" | cut -d"|" -f4)
+
+entry=$(cat "$TMPDIR/entry" 2>/dev/null || echo "stopped|running|stopped")
+nginx_status=$(echo "$entry" | cut -d"|" -f1)
+ssh_status=$(echo "$entry" | cut -d"|" -f2)
+fail2ban_status=$(echo "$entry" | cut -d"|" -f3)
+
+orphan_processes=$(cat "$TMPDIR/orphans" 2>/dev/null || echo "[]")
+orphan_count=$(echo "$orphan_processes" | grep -o '"pid"' | wc -l)
+
+# Safety score
+score=10
+[ "$fail2ban_status" != "running" ] && score=$((score - 2))
+[ "$banned" -gt 0 ] && score=$((score - 1))
+[ "$ssh_fails" -gt 50 ] && score=$((score - 1))
+[ "$ssh_fails" -gt 200 ] && score=$((score - 1))
+[ "$probes" -gt 100 ] && score=$((score - 1))
+[ "$probes" -gt 500 ] && score=$((score - 1))
+[ "$attackers" -gt 10 ] && score=$((score - 1))
+[ "$orphan_count" -gt 0 ] 2>/dev/null && score=$((score - 1))
+[ "$orphan_count" -gt 3 ] 2>/dev/null && score=$((score - 1))
+[ "$score" -lt 1 ] && score=1
+[ "$score" -gt 10 ] && score=10
+
 cat << EOF
 {
-    "safety_score": $safety_score,
+    "safety_score": $score,
     "banned_now": $banned,
     "banned_total": $total_banned,
     "ssh_fails_24h": $ssh_fails,
@@ -144,6 +149,7 @@ cat << EOF
         "nginx": "$nginx_status",
         "ssh": "$ssh_status",
         "fail2ban": "$fail2ban_status"
-    }
+    },
+    "orphan_processes": $orphan_processes
 }
 EOF

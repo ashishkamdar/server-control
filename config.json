@@ -4,7 +4,7 @@
   "apps": [
     {
       "name": "Server Control",
-      "description": "This control panel",
+      "description": "This control panel [:9000]",
       "workdir": "/opt/server-control",
       "start_cmd": "systemctl start server-control",
       "stop_cmd": "systemctl stop server-control",
@@ -17,7 +17,7 @@
     },
     {
       "name": "hetalkamdar.com",
-      "description": "WordPress site (Apache + MySQL + PHP-FPM + Redis)",
+      "description": "WordPress site (Apache + MySQL + PHP-FPM + Redis) [:8080]",
       "workdir": "/var/www/html",
       "start_cmd": "systemctl start mysql && systemctl start php8.3-fpm && systemctl start apache2",
       "stop_cmd": "systemctl stop apache2 && systemctl stop php8.3-fpm && systemctl stop mysql",
@@ -34,7 +34,7 @@
     },
     {
       "name": "areakpi.in",
-      "description": "Static landing page",
+      "description": "Static landing page [nginx static]",
       "workdir": "/var/www/areakpi-landing",
       "start_cmd": "echo 'Static site - served by nginx'",
       "stop_cmd": "echo 'Static site - served by nginx'",
@@ -46,7 +46,7 @@
     },
     {
       "name": "JSG Seating",
-      "description": "Theater seating system",
+      "description": "Theater seating system [:5050]",
       "workdir": "/var/www/jsg-seating",
       "start_cmd": "sudo -u www-data /var/www/jsg-seating/venv/bin/gunicorn --workers 2 --bind 127.0.0.1:5050 wsgi:app --daemon",
       "stop_cmd": "pkill -f 'jsg-seating.*gunicorn' || true",
@@ -68,7 +68,7 @@
     },
     {
       "name": "Change Requests",
-      "description": "Change request tracking system",
+      "description": "Change request tracking system [:5001]",
       "workdir": "/var/www/change-requests",
       "start_cmd": "/var/www/change-requests/venv/bin/gunicorn -w 2 -b 127.0.0.1:5001 wsgi:application --daemon",
       "stop_cmd": "pkill -f 'change-requests.*gunicorn' || true",
@@ -84,7 +84,7 @@
     },
     {
       "name": "Olistic",
-      "description": "Next.js app with Firebase",
+      "description": "Next.js app with Firebase [:3000]",
       "workdir": "/var/www/olistic",
       "start_cmd": "export HOME=/root PM2_HOME=/root/.pm2; cd /var/www/olistic && /usr/bin/pm2 start npm --name olistic -- start",
       "stop_cmd": "export HOME=/root PM2_HOME=/root/.pm2; /usr/bin/pm2 stop olistic",
@@ -105,7 +105,7 @@
     },
     {
       "name": "NSWADI App",
-      "description": "NSWADI application (systemd managed)",
+      "description": "NSWADI application (systemd managed) [:5002]",
       "workdir": "/home/nswadi/app",
       "start_cmd": "systemctl start nswadi",
       "stop_cmd": "systemctl stop nswadi",
@@ -120,7 +120,7 @@
     },
     {
       "name": "Nginx",
-      "description": "Main reverse proxy for all sites",
+      "description": "Main reverse proxy for all sites [reverse proxy]",
       "workdir": "/etc/nginx",
       "start_cmd": "systemctl start nginx",
       "stop_cmd": "systemctl stop nginx",
