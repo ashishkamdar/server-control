@@ -20,29 +20,42 @@ trap "rm -rf $TMPDIR" EXIT
     echo "$banned|$total_banned" > "$TMPDIR/f2b"
 ) &
 
-# 2. SSH fails (24h)
+# 2. SSH fails (24h) — grep auth.log directly (much faster than journalctl)
 (
-    count=$(journalctl -u ssh --since "24 hours ago" 2>/dev/null | grep -c "Failed password\|Invalid user" 2>/dev/null) || count=0
-    if [ "$count" -eq 0 ] 2>/dev/null && [ -f /var/log/auth.log ]; then
-        count=$(grep "$(date +%Y-%m-%d)" /var/log/auth.log 2>/dev/null | grep -c "Failed password\|Invalid user" 2>/dev/null) || count=0
-    fi
+    today_auth=$(date +"%b %d")
+    today_auth2=$(date +"%b  %-d")
+    yesterday_auth=$(date -d "yesterday" +"%b %d" 2>/dev/null || date -v-1d +"%b %d")
+    yesterday_auth2=$(date -d "yesterday" +"%b  %-d" 2>/dev/null || date -v-1d +"%b  %-d")
+    count=$(grep -cE "($today_auth|$today_auth2|$yesterday_auth|$yesterday_auth2).*(Failed password|Invalid user)" /var/log/auth.log 2>/dev/null) || count=0
     echo "${count:-0}" > "$TMPDIR/ssh"
 ) &
 
-# 3. Nginx log analysis — ONE pass for probes, attackers, blocked, last_attack
+# 3. Nginx log analysis — single-pass awk for probes, attackers, blocked, last_attack
 (
     today=$(date +"%d/%b/%Y")
     yesterday=$(date -d "yesterday" +"%d/%b/%Y" 2>/dev/null || date -v-1d +"%d/%b/%Y")
-    probes=0; attackers=0; blocked=0; last_attack="None"
-    if [ -f /var/log/nginx/access.log ]; then
-        relevant=$(grep -E "($today|$yesterday)" /var/log/nginx/access.log 2>/dev/null)
-        probes=$(echo "$relevant" | grep -cE "(\.env|wp-login|phpMyAdmin|\.git|xmlrpc|/admin|/config)" 2>/dev/null || echo 0)
-        blocked=$(echo "$relevant" | grep -cE "(\" 444 |\" 403 )" 2>/dev/null || echo 0)
-        attackers=$(echo "$relevant" | grep -E "(\" 403 |\" 444 |\.env|\.git|wp-login|phpMyAdmin)" 2>/dev/null | awk '{print $1}' | sort -u | wc -l || echo 0)
-        last=$(grep -E "(\.env|\.git|wp-login|phpMyAdmin|xmlrpc)" /var/log/nginx/access.log 2>/dev/null | tail -1 | grep -oP "\[\K[^\]]+(?=\])" || echo "")
-        [ -n "$last" ] && last_attack="$last"
-    fi
-    echo "$probes|$attackers|$blocked|$last_attack" > "$TMPDIR/nginx"
+    awk -v today="$today" -v yesterday="$yesterday" '
+    {
+        if (!index($0, today) && !index($0, yesterday)) next
+
+        is_probe = (index($0, ".env") || index($0, "wp-login") || index($0, "phpMyAdmin") || \
+                    index($0, ".git") || index($0, "xmlrpc") || index($0, "/admin") || index($0, "/config"))
+        if (is_probe) {
+            probes++
+            attackers[$1] = 1
+            match($0, /\[([^\]]+)\]/, m)
+            if (m[1]) last_attack = m[1]
+        }
+        if (index($0, "\" 444 ") || index($0, "\" 403 ")) {
+            blocked++
+            attackers[$1] = 1
+        }
+    }
+    END {
+        a = 0; for (ip in attackers) a++
+        la = (last_attack ? last_attack : "None")
+        printf "%d|%d|%d|%s\n", probes+0, a, blocked+0, la
+    }' /var/log/nginx/access.log 2>/dev/null > "$TMPDIR/nginx"
 ) &
 
 # 4. Entry points

@@ -1,115 +1,114 @@
 #!/bin/bash
-# Nginx metrics
+# Nginx metrics — single-pass awk for all counters + error details
 
-# Last 1 hour (current + previous hour for ~1h coverage)
-HOUR_NOW=$(date +"%d/%b/%Y:%H")
-HOUR_PREV=$(date -d "1 hour ago" +"%d/%b/%Y:%H")
-REQ_1H=$(grep -hE "$HOUR_NOW|$HOUR_PREV" /var/log/nginx/access.log /var/log/nginx/change-requests-access.log 2>/dev/null | wc -l)
-
-# Last 24 hours
 TODAY=$(date +"%d/%b/%Y")
 YESTERDAY=$(date -d "yesterday" +"%d/%b/%Y")
+HOUR_NOW=$(date +"%d/%b/%Y:%H")
+HOUR_PREV=$(date -d "1 hour ago" +"%d/%b/%Y:%H")
 
-# All logs for today/yesterday
-ALL_LOGS=$(grep -hE "$TODAY|$YESTERDAY" /var/log/nginx/access.log /var/log/nginx/change-requests-access.log 2>/dev/null)
+# Single awk pass: counts, visitors, and top-3 error URLs per category
+cat /var/log/nginx/access.log /var/log/nginx/change-requests-access.log 2>/dev/null | \
+awk -v today="$TODAY" -v yesterday="$YESTERDAY" -v hour_now="$HOUR_NOW" -v hour_prev="$HOUR_PREV" '
+{
+    # Check if line is in last 24h
+    is_24h = (index($0, today) || index($0, yesterday))
+    if (!is_24h) next
 
-# Total requests
-TOTAL_REQ=$(echo "$ALL_LOGS" | wc -l)
+    total++
+    visitors[$1] = 1
 
-# Unique visitors
-VISITORS=$(echo "$ALL_LOGS" | awk '{print $1}' | sort -u | wc -l)
+    # Check if in last hour
+    if (index($4, hour_now) || index($4, hour_prev)) req_1h++
 
-# Count response codes
-STATUS_2XX=$(echo "$ALL_LOGS" | grep -c '" 2[0-9][0-9] ' || echo 0)
-STATUS_403=$(echo "$ALL_LOGS" | grep -c '" 403 ' || echo 0)
-STATUS_404=$(echo "$ALL_LOGS" | grep -c '" 404 ' || echo 0)
-STATUS_5XX=$(echo "$ALL_LOGS" | grep -c '" 50[0-5] ' || echo 0)
-
-# Format numbers
-format_num() {
-    local num=$1
-    if [ "$num" -ge 1000000 ]; then
-        echo "$(echo "scale=1; $num/1000000" | bc)M"
-    elif [ "$num" -ge 1000 ]; then
-        echo "$(echo "scale=1; $num/1000" | bc)K"
-    else
-        echo "$num"
-    fi
-}
-
-# Extract error details: URL(count)time - top 3
-get_error_details() {
-    local pattern="$1"
-    echo "$ALL_LOGS" | grep "$pattern" | \
-    awk '{
-        gsub(/\[/, "", $4)
-        split($4, ts, ":")
-        time = ts[2]":"ts[3]
-        url = $7
-        gsub(/\?.*$/, "", url)
-        if (length(url) > 40) url = substr(url, 1, 40)
-        count[url]++
-        last[url] = time
+    # Extract status code — find pattern: " NNN "
+    status = ""
+    for (i = 1; i <= NF; i++) {
+        if ($i ~ /^[0-9][0-9][0-9]$/ && $(i-1) ~ /"$/) { status = $i; break }
     }
-    END {
-        n = 0
-        for (url in count) {
-            urls[n] = url; counts[n] = count[url]; times[n] = last[url]; n++
-        }
-        for (i = 0; i < n-1; i++) {
-            for (j = i+1; j < n; j++) {
-                if (counts[j] > counts[i]) {
-                    tmp = urls[i]; urls[i] = urls[j]; urls[j] = tmp
-                    tmp = counts[i]; counts[i] = counts[j]; counts[j] = tmp
-                    tmp = times[i]; times[i] = times[j]; times[j] = tmp
-                }
-            }
-        }
-        for (i = 0; i < 3 && i < n; i++) {
-            if (i > 0) printf " | "
-            printf "%s (%d) @%s", urls[i], counts[i], times[i]
-        }
-    }'
+    if (status == "") next
+
+    if (status ~ /^2/) { s2xx++ }
+    else if (status == "404") {
+        s404++
+        url = $7; gsub(/\?.*$/, "", url)
+        if (length(url) > 40) url = substr(url, 1, 40)
+        e404_c[url]++
+        gsub(/\[/, "", $4); split($4, ts, ":"); e404_t[url] = ts[2]":"ts[3]
+    }
+    else if (status == "403") {
+        s403++
+        url = $7; gsub(/\?.*$/, "", url)
+        if (length(url) > 40) url = substr(url, 1, 40)
+        e403_c[url]++
+        gsub(/\[/, "", $4); split($4, ts, ":"); e403_t[url] = ts[2]":"ts[3]
+    }
+    else if (status ~ /^5/) {
+        s5xx++
+        url = $7; gsub(/\?.*$/, "", url)
+        if (length(url) > 40) url = substr(url, 1, 40)
+        e5xx_c[url]++
+        gsub(/\[/, "", $4); split($4, ts, ":"); e5xx_t[url] = ts[2]":"ts[3]
+    }
 }
 
-TOTAL_FMT=$(format_num $TOTAL_REQ)
-OK_FMT=$(format_num $STATUS_2XX)
+function format_num(n) {
+    if (n >= 1000000) return sprintf("%.1fM", n/1000000)
+    if (n >= 1000) return sprintf("%.1fK", n/1000)
+    return n+0
+}
 
-# Get error details
-ERR_5XX_DETAILS=$(get_error_details '" 50[0-5] ')
-ERR_404_DETAILS=$(get_error_details '" 404 ')
-ERR_403_DETAILS=$(get_error_details '" 403 ')
+function top3(counts, times,    n, i, j, tmp, urls, cnts, tms, result) {
+    n = 0
+    for (u in counts) { urls[n] = u; cnts[n] = counts[u]; tms[n] = times[u]; n++ }
+    for (i = 0; i < n-1; i++)
+        for (j = i+1; j < n; j++)
+            if (cnts[j] > cnts[i]) {
+                tmp=urls[i]; urls[i]=urls[j]; urls[j]=tmp
+                tmp=cnts[i]; cnts[i]=cnts[j]; cnts[j]=tmp
+                tmp=tms[i]; tms[i]=tms[j]; tms[j]=tmp
+            }
+    result = ""
+    for (i = 0; i < 3 && i < n; i++) {
+        if (i > 0) result = result " | "
+        result = result urls[i] " (" cnts[i] ") @" tms[i]
+    }
+    return result
+}
 
-# Build JSON output
-OUTPUT="["
-OUTPUT+="{\"label\":\"Req/1h\",\"value\":\"$REQ_1H\"},"
-OUTPUT+="{\"label\":\"Requests 24h\",\"value\":\"$TOTAL_FMT\"},"
-OUTPUT+="{\"label\":\"Visitors 24h\",\"value\":\"$VISITORS\"},"
-OUTPUT+="{\"label\":\"2xx OK\",\"value\":\"$OK_FMT\",\"color\":\"#00b894\"},"
+END {
+    vis = 0; for (v in visitors) vis++
+    printf "["
+    printf "{\"label\":\"Req/1h\",\"value\":\"%s\"},", format_num(req_1h+0)
+    printf "{\"label\":\"Requests 24h\",\"value\":\"%s\"},", format_num(total+0)
+    printf "{\"label\":\"Visitors 24h\",\"value\":\"%d\"},", vis
+    printf "{\"label\":\"2xx OK\",\"value\":\"%s\",\"color\":\"#00b894\"},", format_num(s2xx+0)
 
-# 5xx errors
-if [ "$STATUS_5XX" -gt 0 ]; then
-    OUTPUT+="{\"label\":\"5xx Err\",\"value\":\"$STATUS_5XX\",\"color\":\"#e74c3c\"},"
-    OUTPUT+="{\"label\":\"5xx URLs\",\"value\":\"$ERR_5XX_DETAILS\",\"color\":\"#e74c3c; font-weight:300; font-size:0.8em\"},"
-else
-    OUTPUT+="{\"label\":\"5xx Err\",\"value\":\"0\",\"color\":\"#888\"},"
-fi
+    if (s5xx > 0) {
+        printf "{\"label\":\"5xx Err\",\"value\":\"%d\",\"color\":\"#e74c3c\"},", s5xx
+        d = top3(e5xx_c, e5xx_t)
+        gsub(/"/, "\\\"", d)
+        printf "{\"label\":\"5xx URLs\",\"value\":\"%s\",\"color\":\"#e74c3c; font-weight:300; font-size:0.8em\"},", d
+    } else {
+        printf "{\"label\":\"5xx Err\",\"value\":\"0\",\"color\":\"#888\"},"
+    }
 
-# 404 errors
-if [ "$STATUS_404" -gt 0 ]; then
-    OUTPUT+="{\"label\":\"404 Err\",\"value\":\"$STATUS_404\",\"color\":\"#f39c12\"},"
-    OUTPUT+="{\"label\":\"404 URLs\",\"value\":\"$ERR_404_DETAILS\",\"color\":\"#f39c12; font-weight:300; font-size:0.8em\"},"
-else
-    OUTPUT+="{\"label\":\"404 Err\",\"value\":\"0\",\"color\":\"#888\"},"
-fi
+    if (s404 > 0) {
+        printf "{\"label\":\"404 Err\",\"value\":\"%d\",\"color\":\"#f39c12\"},", s404
+        d = top3(e404_c, e404_t)
+        gsub(/"/, "\\\"", d)
+        printf "{\"label\":\"404 URLs\",\"value\":\"%s\",\"color\":\"#f39c12; font-weight:300; font-size:0.8em\"},", d
+    } else {
+        printf "{\"label\":\"404 Err\",\"value\":\"0\",\"color\":\"#888\"},"
+    }
 
-# 403 errors
-if [ "$STATUS_403" -gt 0 ]; then
-    OUTPUT+="{\"label\":\"403 Err\",\"value\":\"$STATUS_403\",\"color\":\"#9b59b6\"},"
-    OUTPUT+="{\"label\":\"403 URLs\",\"value\":\"$ERR_403_DETAILS\",\"color\":\"#9b59b6; font-weight:300; font-size:0.8em\"}"
-else
-    OUTPUT+="{\"label\":\"403 Err\",\"value\":\"0\",\"color\":\"#888\"}"
-fi
+    if (s403 > 0) {
+        printf "{\"label\":\"403 Err\",\"value\":\"%d\",\"color\":\"#9b59b6\"},", s403
+        d = top3(e403_c, e403_t)
+        gsub(/"/, "\\\"", d)
+        printf "{\"label\":\"403 URLs\",\"value\":\"%s\",\"color\":\"#9b59b6; font-weight:300; font-size:0.8em\"}", d
+    } else {
+        printf "{\"label\":\"403 Err\",\"value\":\"0\",\"color\":\"#888\"}"
+    }
 
-OUTPUT+="]"
-echo "$OUTPUT"
+    printf "]\n"
+}'

@@ -67,6 +67,37 @@
       "auto_scale_down_threshold": 2
     },
     {
+      "name": "JSG Scanner",
+      "description": "Kiosk QR scanner (jsg1.areakpi.in/scan/kiosk) — shares process with JSG Seating [:5050]. Controls in JSG Seating.",
+      "workdir": "/var/www/jsg-seating",
+      "start_cmd": "echo 'Use JSG Seating controls — shared gunicorn process on :5050'",
+      "stop_cmd": "echo 'Use JSG Seating controls — shared gunicorn process on :5050'",
+      "status_cmd": "pgrep -f 'jsg-seating.*gunicorn' && echo running",
+      "proc_match": "jsg-seating.*gunicorn",
+      "deps": [
+        "JSG Seating",
+        "gunicorn",
+        "PWA"
+      ],
+      "metrics_cmd": "/opt/server-control/scanner_metrics.sh",
+      "log_pattern": "jsg1.areakpi.in"
+    },
+    {
+      "name": "JSG Superadmin",
+      "description": "Multi-tenant management (jsg1.areakpi.in/superadmin) — shares process with JSG Seating [:5050]. Controls in JSG Seating.",
+      "workdir": "/var/www/jsg-seating",
+      "start_cmd": "echo 'Use JSG Seating controls — shared gunicorn process on :5050'",
+      "stop_cmd": "echo 'Use JSG Seating controls — shared gunicorn process on :5050'",
+      "status_cmd": "pgrep -f 'jsg-seating.*gunicorn' && echo running",
+      "proc_match": "jsg-seating.*gunicorn",
+      "deps": [
+        "JSG Seating",
+        "gunicorn"
+      ],
+      "metrics_cmd": "/opt/server-control/superadmin_metrics.sh",
+      "log_pattern": "jsg1.areakpi.in"
+    },
+    {
       "name": "Change Requests",
       "description": "Change request tracking system [:5001]",
       "workdir": "/var/www/change-requests",

@@ -8,6 +8,16 @@
 - **Password**: stored in `config.json` (field: `password`) — single login only (nginx basic auth removed 2026-04-02)
 - **Session**: 1-year rolling cookie, refreshes on every page load — login once, stay logged in
 
+## Git Repositories
+
+| Repo | URL | Contents |
+|------|-----|----------|
+| **Server Control** | https://github.com/ashishkamdar/server-control | Server control dashboard (Go app) |
+| **JSG Seating (main)** | https://github.com/ashishkamdar/jsg1 | Main JSG Seating app — admin, allocation, groups, tickets, templates, models |
+| **JSG Scanner** | https://github.com/ashishkamdar/jsg1-scanner | Kiosk scanner only — scanner_kiosk.html, scan routes, service worker, PWA |
+
+All three deploy to the same Nuremberg server. JSG repos map to `/var/www/jsg-seating/`.
+
 ## Hosted Applications (monitored in control panel)
 
 | App | URL | Local Port | Workdir | Stack | Process Manager |
@@ -16,6 +26,8 @@
 | hetalkamdar.com | https://hetalkamdar.com | 8080 | `/var/www/html` | WordPress, Apache, MySQL, PHP 8.3, Redis | systemd |
 | areakpi.in | https://areakpi.in | — | `/var/www/areakpi-landing` | nginx static | — |
 | JSG Seating | https://jsg1.areakpi.in | 5050 | `/var/www/jsg-seating` | Python, SQLite, gunicorn | systemd |
+| JSG Scanner (sidecar) | https://jsg1.areakpi.in/scan/kiosk | 5050 | `/var/www/jsg-seating` | PWA, service worker | — (shares JSG Seating process) |
+| JSG Superadmin (sidecar) | https://jsg1.areakpi.in/superadmin | 5050 | `/var/www/jsg-seating` | Multi-tenant management | — (shares JSG Seating process) |
 | Change Requests | https://cr.areakpi.in | 5001 | `/var/www/change-requests` | Python, SQLite, gunicorn | PM2 |
 | Olistic | https://olistic.areakpi.in | 3000 | `/var/www/olistic` | Next.js, Firebase | PM2 |
 | Netra Security | https://netram.areakpi.in | 3001 | `/var/www/netra` | Next.js | PM2 |
@@ -196,7 +208,7 @@ ssh nuremberg 'ls /etc/nginx/sites-enabled/'
 | Drop-in app configs | `/opt/server-control/apps.d/*.json` |
 | JSG Seating DB | `/var/www/jsg-seating/data/jsg_seating.db` |
 | JSG Seating metrics | `/var/www/jsg-seating/get_metrics.py` |
-| Server Control metrics | `/opt/server-control/get_metrics_jsg.py`, `hetal_metrics.sh`, `security_metrics.sh`, `nginx_metrics.sh`, `olistic_metrics.sh`, `nymaara_metrics.sh`, `nt_gold_metrics.sh` |
+| Server Control metrics | `/opt/server-control/get_metrics_jsg.py`, `hetal_metrics.sh`, `security_metrics.sh`, `nginx_metrics.sh`, `olistic_metrics.sh`, `nymaara_metrics.sh`, `nt_gold_metrics.sh`, `scanner_metrics.sh`, `superadmin_metrics.sh` |
 | fail2ban config | `/etc/fail2ban/` |
 | PM2 config | `HOME=/root PM2_HOME=/root/.pm2` (must export before pm2 commands) |
 | SSL certs | `/etc/letsencrypt/live/<domain>/` |
@@ -210,6 +222,7 @@ ssh nuremberg 'ls /etc/nginx/sites-enabled/'
 - **Metrics**: Each app can optionally have a `metrics_cmd` that returns JSON array of `{label, value, color}` objects.
 - **Process stats**: One `ps aux` call (cached 60s) + batched `pm2 pid` calls serve CPU/RAM for all apps. No `pm2 jlist` (it was causing 128% CPU spikes).
 - **Disk stats**: One `du -sh` call for all workdirs, cached 24 hours.
+- **Sidecar apps**: JSG Scanner and JSG Superadmin are "sidecar" entries — they share JSG Seating's gunicorn process on :5050 (same workdir, same `proc_match`). Their start/stop buttons display an info message directing operators to use JSG Seating controls. Status tracks the shared process. Each has its own metrics script (`scanner_metrics.sh`, `superadmin_metrics.sh`).
 - **Auto-scaling**: JSG Seating supports auto-scaling via gunicorn worker management (TTIN/TTOU signals). Olistic and Nymaara support PM2 scaling.
 - **Slack alerts**: Configured via `slack_webhook` in config.json. Alerts for CPU/RAM thresholds (75/85/95%), worker count changes, and app crashes.
 - **Daily Ticket Logs**: JSG Seating parses nginx access logs for `/seats/` requests, grouped by day (Today/Yesterday/2 Days Ago) and by ticket code. Cached 5 minutes.
@@ -247,15 +260,18 @@ Design principles:
 
 ## Performance Notes
 
-- **Page load timeline** (as of 2026-04-07):
+- **Page load timeline** (as of 2026-04-18):
   - TTFB: **0.6ms** (loading screen delivered instantly via HTTP streaming)
-  - Full page (warm cache): **~1.7s** (bottleneck: slowest parallel app, typically nginx_metrics.sh)
-  - Full page (cold disk cache): **~4.5s** (disk cache refresh adds ~1s, runs once per 24h)
+  - Full page (warm cache): **~1.4s** (bottleneck: slowest parallel app, typically security_metrics.sh at ~600ms)
+  - Full page (cold): **~1.7s**
   - Previous: **7.4s** blocking TTFB (sequential app status, no streaming)
 - **Key optimizations applied 2026-04-07**:
   - Parallelized `getAppStatus()` — 21 goroutines run concurrently (was sequential loop)
   - HTTP chunked streaming — loading screen sent before data gathering begins
   - Security metrics script parallelized (5 background jobs + cgroup-based orphan detection) — 2.3s → 0.65s
+- **Key optimizations applied 2026-04-18**:
+  - `nginx_metrics.sh`: Rewrote 8-pass grep/wc/awk into single-pass awk — **550ms → 73ms** (7.5x faster)
+  - `security_metrics.sh`: Replaced `journalctl -u ssh` (417ms) with `grep` on auth.log (11ms); converted nginx log section to single-pass awk — **670ms → 600ms**
 - **Subprocess budget per page load**: ~35 calls (all run in parallel)
   - 1x `ps aux` (cached 60s) — serves all apps' CPU/RAM
   - 1x batched `pm2 pid` (cached 60s) — one command gets all PM2 PIDs (replaced `pm2 jlist` which caused CPU spikes)
@@ -302,6 +318,7 @@ Design principles:
 
 ## Change Log
 
+- **2026-04-18**: Added JSG Scanner and JSG Superadmin as sidecar apps of JSG Seating. Both share the same gunicorn process on :5050 — status syncs with JSG Seating, start/stop buttons direct operators to parent controls. Scanner metrics: Total Scans, Today, Active Event, Events, Scanners (`scanner_metrics.sh`). Superadmin metrics: Tenants, Active, Admins, Backups (`superadmin_metrics.sh`). Performance: rewrote `nginx_metrics.sh` from 8-pass grep/awk to single-pass awk (550ms → 73ms), replaced `journalctl` with grep on auth.log in `security_metrics.sh` (417ms → 11ms). Overall page load improved from ~2.2s → ~1.7s cold, ~1.7s → ~1.4s warm.
 - **2026-04-07**: Added NT Precious Metals app (nt.areakpi.in, port 3020, PM2 `nt-metals`, Next.js + SQLite) with drop-in config (`apps.d/nt-gold.json`) and metrics script (`nt_gold_metrics.sh` — CPU, Memory, Restarts, Uptime, Req/1h). Added `port` field to App struct and all app configs — ports shown in descriptions and new Port Reference section (sorted by port, with process count and status). Added Orphan Process Monitor with cgroup-based detection and Kill button (SIGTERM → SIGKILL with cgroup safety check, `/kill-orphan` endpoint). Major performance overhaul: parallelized `getAppStatus()` via goroutines (7.4s → 1.7s), HTTP chunked streaming for instant loading screen (0.6ms TTFB), optimized `security_metrics.sh` (parallelized 5 sections + replaced `systemctl status` per-PID with `/proc/cgroup` reads, 2.3s → 0.65s). Redesigned UI from dark theme to royal off-white light theme — warm off-white background (#f5f3ef), white cards with subtle borders/shadows, Georgia serif font, saddle brown accents (#8b4513), royal blue app names (#2c5f8a), warm brown for ports (#b8700d), darker muted greens/reds for status indicators.
 - **2026-04-05**: Synced DB with Excel for Drama 2 Large Batch (11 members added, 8 seats fixed). Propagated 10 fixed-seat members to Dramas 3–10. Fixed batch date independence bug (drama detail form now has separate date fields per batch). Fixed `Batch` import in ticket_generator.py. Generated 890 Large Batch tickets — all verified against Excel and DB. Added "Fixed & Groupwise Sorting" sheet and ticket links to Excel.
 - **2026-04-04**: Replaced "Recent Tickets" with Daily Ticket Logs (Today/Yesterday/2 Days Ago) — grouped by ticket code with ×count, devices, and unique/total hit headers. Cached 5 minutes. Fixed log parsing to exclude bots/curl and read .gz files.
