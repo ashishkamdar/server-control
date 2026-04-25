@@ -23,13 +23,12 @@ def get_metrics():
             ticket_count = len([f for f in os.listdir(TICKETS_DIR)
                                if f.endswith(".html") and "_admin" not in f])
 
-        # Last 24 hours ticket views from nginx logs
+        # Today's ticket views from nginx logs (matches getDayTicketLogs filtering)
         recent_lookups = 0
         unique_lookups = 0
         try:
             today_str = datetime.now().strftime("%d/%b/%Y")
-            yesterday_str = (datetime.now() - timedelta(days=1)).strftime("%d/%b/%Y")
-            date_filter = f"grep '/seats/' {NGINX_LOG} 2>/dev/null | grep -E '({today_str}|{yesterday_str})' | grep -E '\" (200|304) '"
+            date_filter = f"grep '/seats/' {NGINX_LOG} 2>/dev/null | grep '{today_str}' | grep -E '\" (200|304) ' | grep -v 'bot' | grep -v 'Bot' | grep -v 'curl/' | grep -v 'spider' | grep -v 'crawler' | grep -E '(Safari/|Chrome/|Firefox/)'"
             result = subprocess.run(
                 ["bash", "-c", f"{date_filter} | wc -l"],
                 capture_output=True, text=True
@@ -170,7 +169,7 @@ def get_metrics():
             {"label": "RAM", "value": f"{int(total_ram_mb)}MB", "color": "#9b59b6"},
             {"label": "Req/min", "value": req_per_min, "color": "#3498db"},
             {"label": "Active 5m", "value": active_users, "color": "#00b894"},
-            {"label": "Lookups 24h", "value": f"{recent_lookups} ({unique_lookups}u)"},
+            {"label": "Lookups Today", "value": f"{recent_lookups} ({unique_lookups}u)"},
             {"label": "Avg Resp", "value": f"{avg_response_ms}ms", "color": "#e74c3c"},
             {"label": "MB/Worker", "value": f"{int(mem_per_worker)}", "color": "#f39c12"},
             {"label": "Worker Age", "value": worker_age_str, "color": "#1abc9c"},
