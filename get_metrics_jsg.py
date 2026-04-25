@@ -23,13 +23,17 @@ def get_metrics():
             ticket_count = len([f for f in os.listdir(TICKETS_DIR)
                                if f.endswith(".html") and "_admin" not in f])
 
-        # Last 24 hours lookups
+        # Last 24 hours ticket views from nginx logs
         recent_lookups = 0
-        yesterday = (datetime.now() - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
         try:
-            cur.execute("SELECT COUNT(*) FROM ticket_access_logs WHERE accessed_at >= ?", (yesterday,))
-            recent_lookups = cur.fetchone()[0]
-        except sqlite3.OperationalError:
+            today_str = datetime.now().strftime("%d/%b/%Y")
+            yesterday_str = (datetime.now() - timedelta(days=1)).strftime("%d/%b/%Y")
+            result = subprocess.run(
+                ["bash", "-c", f"grep '/seats/' {NGINX_LOG} 2>/dev/null | grep -E '({today_str}|{yesterday_str})' | grep -cE '\" (200|304) '"],
+                capture_output=True, text=True
+            )
+            recent_lookups = int(result.stdout.strip() or 0)
+        except:
             pass
 
         conn.close()
