@@ -8,7 +8,6 @@ from datetime import datetime, timedelta
 
 DB_PATH = "/var/www/jsg-seating/data/jsg_seating.db"
 TICKETS_DIR = "/var/www/jsg-seating/static/tickets"
-STATE_FILE = "/var/www/jsg-seating/data/autoscaler_state.txt"
 ACTIVE_SCRIPT = "/var/www/jsg-seating/count_active.sh"
 NGINX_LOG = "/var/log/nginx/access.log"
 
@@ -23,12 +22,13 @@ def get_metrics():
             ticket_count = len([f for f in os.listdir(TICKETS_DIR)
                                if f.endswith(".html") and "_admin" not in f])
 
-        # Today's ticket views from nginx logs (matches getDayTicketLogs filtering)
+        # Last 24 hours ticket views from nginx logs
         recent_lookups = 0
         unique_lookups = 0
         try:
             today_str = datetime.now().strftime("%d/%b/%Y")
-            date_filter = f"grep '/seats/' {NGINX_LOG} 2>/dev/null | grep '{today_str}' | grep -E '\" (200|304) ' | grep -v 'bot' | grep -v 'Bot' | grep -v 'curl/' | grep -v 'spider' | grep -v 'crawler' | grep -E '(Safari/|Chrome/|Firefox/)'"
+            yesterday_str = (datetime.now() - timedelta(days=1)).strftime("%d/%b/%Y")
+            date_filter = f"grep '/seats/' {NGINX_LOG} 2>/dev/null | grep -E '({today_str}|{yesterday_str})' | grep -E '\" (200|304) ' | grep -v 'bot' | grep -v 'Bot' | grep -v 'curl/' | grep -v 'spider' | grep -v 'crawler' | grep -E '(Safari/|Chrome/|Firefox/)'"
             result = subprocess.run(
                 ["bash", "-c", f"{date_filter} | wc -l"],
                 capture_output=True, text=True
@@ -138,28 +138,15 @@ def get_metrics():
         except:
             pass
 
-        # Get autoscaler state
-        autoscale_status = "off"
+        # Requests per minute from nginx (last 5 min average)
         req_per_min = 0
         try:
             result = subprocess.run(
-                ["systemctl", "is-active", "jsg-autoscaler"],
+                ["bash", "-c", f"awk -v cutoff=\"$(date -d '5 minutes ago' '+%d/%b/%Y:%H:%M')\" '$0 ~ /jsg1.areakpi.in/ && $4 >= \"[\"cutoff' {NGINX_LOG} 2>/dev/null | wc -l"],
                 capture_output=True, text=True
             )
-            if result.stdout.strip() == "active":
-                autoscale_status = "on"
-                if os.path.exists(STATE_FILE):
-                    with open(STATE_FILE) as f:
-                        parts = f.read().strip().split("|")
-                        if len(parts) >= 3:
-                            last_action = parts[1]
-                            req_per_min = int(parts[2])
-                            if last_action == "scaled_up":
-                                autoscale_status = "↑"
-                            elif last_action == "scaled_down":
-                                autoscale_status = "↓"
-                            else:
-                                autoscale_status = "auto"
+            count_5m = int(result.stdout.strip() or 0)
+            req_per_min = count_5m // 5
         except:
             pass
 
@@ -169,7 +156,7 @@ def get_metrics():
             {"label": "RAM", "value": f"{int(total_ram_mb)}MB", "color": "#9b59b6"},
             {"label": "Req/min", "value": req_per_min, "color": "#3498db"},
             {"label": "Active 5m", "value": active_users, "color": "#00b894"},
-            {"label": "Lookups Today", "value": f"{recent_lookups} ({unique_lookups}u)"},
+            {"label": "Lookups 24h", "value": f"{recent_lookups} ({unique_lookups}u)"},
             {"label": "Avg Resp", "value": f"{avg_response_ms}ms", "color": "#e74c3c"},
             {"label": "MB/Worker", "value": f"{int(mem_per_worker)}", "color": "#f39c12"},
             {"label": "Worker Age", "value": worker_age_str, "color": "#1abc9c"},
