@@ -25,14 +25,21 @@ def get_metrics():
 
         # Last 24 hours ticket views from nginx logs
         recent_lookups = 0
+        unique_lookups = 0
         try:
             today_str = datetime.now().strftime("%d/%b/%Y")
             yesterday_str = (datetime.now() - timedelta(days=1)).strftime("%d/%b/%Y")
+            date_filter = f"grep '/seats/' {NGINX_LOG} 2>/dev/null | grep -E '({today_str}|{yesterday_str})' | grep -E '\" (200|304) '"
             result = subprocess.run(
-                ["bash", "-c", f"grep '/seats/' {NGINX_LOG} 2>/dev/null | grep -E '({today_str}|{yesterday_str})' | grep -cE '\" (200|304) '"],
+                ["bash", "-c", f"{date_filter} | wc -l"],
                 capture_output=True, text=True
             )
             recent_lookups = int(result.stdout.strip() or 0)
+            result = subprocess.run(
+                ["bash", "-c", f"{date_filter} | grep -oP '/seats/\\K[A-Z]+-[0-9]+' | sort -u | wc -l"],
+                capture_output=True, text=True
+            )
+            unique_lookups = int(result.stdout.strip() or 0)
         except:
             pass
 
@@ -163,7 +170,7 @@ def get_metrics():
             {"label": "RAM", "value": f"{int(total_ram_mb)}MB", "color": "#9b59b6"},
             {"label": "Req/min", "value": req_per_min, "color": "#3498db"},
             {"label": "Active 5m", "value": active_users, "color": "#00b894"},
-            {"label": "Lookups 24h", "value": recent_lookups},
+            {"label": "Lookups 24h", "value": f"{recent_lookups} ({unique_lookups}u)"},
             {"label": "Avg Resp", "value": f"{avg_response_ms}ms", "color": "#e74c3c"},
             {"label": "MB/Worker", "value": f"{int(mem_per_worker)}", "color": "#f39c12"},
             {"label": "Worker Age", "value": worker_age_str, "color": "#1abc9c"},
