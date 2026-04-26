@@ -316,8 +316,77 @@ Design principles:
 - `/var/www/jsg-seating/data/jsg_2026.db.bak_20260405`
 - `/var/www/jsg-seating/data/jsg_2026.db.bak2_20260405`
 
+## JSG Kiosk Scanner
+
+### Architecture
+- **URL**: https://jsg1.areakpi.in/scan/kiosk (PWA-installable)
+- **Git repo**: https://github.com/ashishkamdar/jsg1-scanner (scanner only)
+- **Main app repo**: https://github.com/ashishkamdar/jsg1 (everything else)
+- **Server**: `/var/www/jsg-seating/` on nuremberg (both repos share same directory)
+
+### Features
+- Full-screen camera with jsQR, crosshair, red laser line, blur overlay
+- 6-digit PIN login per admin (5 admins configured)
+- Local-first scanning — IndexedDB member cache, instant validation
+- Couple QR logic: 1st scan = green (+2 count), 2nd = orange (partner late), 3rd+ = RED
+- Single QR logic: 1st scan = green (+1 count), 2nd+ = RED
+- Invalid/unregistered QR = RED with "QR not registered with JSG Matunga!"
+- **Real-time cross-admin duplicate detection via SSE** (Server-Sent Events)
+  - Each device opens persistent connection to `/api/scan/<event_id>/stream`
+  - Server broadcasts every scan instantly to all connected admin devices
+  - No polling gap — duplicates detected in milliseconds across devices
+  - Auto-reconnects on connection drop (5s retry)
+- Event selector with today-highlight after PIN login
+- Info drawer: big scan count, network status, cached members, history (latest on top), CSV export
+- Manual entry drawer (M button): type member code, shows couple preview, Check In button
+- **Real-time total scan count** — `X / 1061 scanned` syncs across ALL admin devices via SSE
+- **Active scanners badge** (📡 3) — shows number of connected scanner devices, updates on connect/disconnect
+  - SSE broadcasts `scanner_count` events when scanners join/leave
+  - API: `GET /api/scan/<event_id>/active-scanners`
+- People count badge (👥), manual entry count badge on M button
+- Light/dark overlay toggle, camera swap, sound (Web Audio API tones)
+- PWA with JSG Matunga icon, Service Worker (v4) for offline caching + auto-update
+- Offline scan queue with auto-sync on reconnect
+
+### Scanner Admin PINs
+| # | Name | PIN |
+|---|------|-----|
+| 1 | Sunil Saiya | 123456 |
+| 2 | Rohit Mehta | 654321 |
+| 3 | Admin-1 | 111222 |
+| 4 | Admin-2 | 333444 |
+| 5 | Admin-3 | 555666 |
+
+### Key Files (on server)
+| File | Purpose |
+|------|---------|
+| `templates/scan/scanner_kiosk.html` | Kiosk scanner UI (1220+ lines) |
+| `templates/scan/scanner_kiosk.html.working_backup_20260418` | Known-good backup |
+| `routes/scan.py` | Scanner routes, scan API, SSE broadcast, PIN verify |
+| `static/sw-kiosk.js` | Service Worker for offline caching |
+| `static/images/jsg-pwa-*.png` | PWA icons (JSG Matunga) |
+| `static/images/jsg-logo-white.png` | White logo for dark overlay |
+| `static/images/jsg-logo-dark.png` | Dark logo for light overlay |
+
+### API Endpoints
+| Method | Path | Purpose |
+|--------|------|---------|
+| POST | `/scan/api/verify-pin` | 6-digit PIN verification |
+| GET | `/api/scan/events` | List active events with scan counts |
+| POST | `/api/scan` | Record QR scan (expects `qr_text` + `event_id`) |
+| GET | `/api/scan/<id>/members` | Download member list for offline cache |
+| GET | `/api/scan/<id>/scans` | Download existing scans for dedup |
+| GET | `/api/scan/<id>/stream` | SSE stream — real-time scan broadcasts |
+| POST | `/api/scan/bulk-sync` | Upload offline pending scans |
+| POST | `/api/scan/<id>/clear` | Delete all scans for event (slider) |
+
 ## Change Log
 
+- **2026-04-26**: CRITICAL FIX — 171 double-booked seats caused chaos at Drama 3 live show. Root cause: legacy `SATURDAY`/`SUNDAY` show_slot values in seat_assignments coexisted with new `B1`/`B2` values, causing same physical seats to be assigned to two different members. Fix: deleted all legacy SATURDAY/SUNDAY assignments, migrated remaining to B1/B2, re-ran full allocation for dramas 3-9, removed all B2 seat assignments (Small Batch doesn't need seating). Added `allocation_enabled` column to batches table — B2 set to disabled (default OFF) so allocation never assigns B2 seats again. Fixed allocation code duplicate check with `db.session.no_autoflush`. Deleted Drama 10. Public page shows "Next Drama Coming Soon" with ticket lookup disabled. Final state: 888 B1 members seated per drama, zero conflicts, zero B2 seats. Awaiting fresh member/group list from Sunil bhai for future re-do.
+- **2026-04-26**: Added real-time total scan count across all admin devices + active scanners badge (📡 N). SSE broadcasts scanner_count on connect/disconnect. API: `/api/scan/<id>/active-scanners`. SW bumped to v4 for PWA auto-update. Pushed to jsg1-scanner repo.
+- **2026-04-25**: Fixed kiosk routes lost after deployment overwrite — restored kiosk_entry, verify_pin, api_events, scan_stream (SSE), sw_kiosk, clear_scans routes. Added scanner_pin back to AdminUser model. Saved working backups.
+- **2026-04-22**: Kiosk Scanner — implemented real-time cross-admin duplicate detection via SSE (Server-Sent Events). Each admin device opens persistent connection; scans broadcast instantly to all devices. Singles: 2nd+ scan = RED. Couples: 2nd = orange (partner late), 3rd+ = RED. Invalid/unregistered QR = RED with "QR not registered with JSG Matunga!". Removed 30-second polling.
+- **2026-04-18**: Kiosk Scanner — full-screen camera with jsQR, PIN login (6-digit, 5 admins), local-first scanning with IndexedDB, couple QR logic, event selector with today-highlight, info drawer with CSV export, manual entry drawer, people count badge, blur overlay, PWA icons, Service Worker. Working backup saved. Pushed to https://github.com/ashishkamdar/jsg1-scanner.
 - **2026-04-18**: Added JSG Scanner and JSG Superadmin as sidecar apps of JSG Seating. Both share the same gunicorn process on :5050 — status syncs with JSG Seating, start/stop buttons direct operators to parent controls. Scanner metrics: Total Scans, Today, Active Event, Events, Scanners (`scanner_metrics.sh`). Superadmin metrics: Tenants, Active, Admins, Backups (`superadmin_metrics.sh`). Performance: rewrote `nginx_metrics.sh` from 8-pass grep/awk to single-pass awk (550ms → 73ms), replaced `journalctl` with grep on auth.log in `security_metrics.sh` (417ms → 11ms). Overall page load improved from ~2.2s → ~1.7s cold, ~1.7s → ~1.4s warm.
 - **2026-04-07**: Added NT Precious Metals app (nt.areakpi.in, port 3020, PM2 `nt-metals`, Next.js + SQLite) with drop-in config (`apps.d/nt-gold.json`) and metrics script (`nt_gold_metrics.sh` — CPU, Memory, Restarts, Uptime, Req/1h). Added `port` field to App struct and all app configs — ports shown in descriptions and new Port Reference section (sorted by port, with process count and status). Added Orphan Process Monitor with cgroup-based detection and Kill button (SIGTERM → SIGKILL with cgroup safety check, `/kill-orphan` endpoint). Major performance overhaul: parallelized `getAppStatus()` via goroutines (7.4s → 1.7s), HTTP chunked streaming for instant loading screen (0.6ms TTFB), optimized `security_metrics.sh` (parallelized 5 sections + replaced `systemctl status` per-PID with `/proc/cgroup` reads, 2.3s → 0.65s). Redesigned UI from dark theme to royal off-white light theme — warm off-white background (#f5f3ef), white cards with subtle borders/shadows, Georgia serif font, saddle brown accents (#8b4513), royal blue app names (#2c5f8a), warm brown for ports (#b8700d), darker muted greens/reds for status indicators.
 - **2026-04-05**: Synced DB with Excel for Drama 2 Large Batch (11 members added, 8 seats fixed). Propagated 10 fixed-seat members to Dramas 3–10. Fixed batch date independence bug (drama detail form now has separate date fields per batch). Fixed `Batch` import in ticket_generator.py. Generated 890 Large Batch tickets — all verified against Excel and DB. Added "Fixed & Groupwise Sorting" sheet and ticket links to Excel.
